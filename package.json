@@ -1,0 +1,35 @@
+{
+  "name": "yt-dls",
+  "version": "0.1.0",
+  "description": "API simples para download de vídeos do YouTube usando yt-dlp",
+  "author": "Kaiky Brito <https://github.com/kaikybrofc>",
+  "license": "MIT",
+  "private": false,
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "install:yt-dlp": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kaikybrofc/yt-dls"
+  },
+  "bugs": {
+    "url": "https://github.com/kaikybrofc/yt-dls/issues"
+  },
+  "homepage": "https://github.com/kaikybrofc/yt-dls",
+  "keywords": [
+    "yt-dlp",
+    "youtube",
+    "download",
+    "api",
+    "nodejs",
+    "express"
+  ],
+  "dependencies": {
+    "express": "^4.19.2",
+    "yt-dlp-wrap": "^2.3.12"
+  }
+}

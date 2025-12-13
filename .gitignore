@@ -1,0 +1,5 @@
+/.env
+/bin
+/cookies.txt
+/downloads
+/node_modules
