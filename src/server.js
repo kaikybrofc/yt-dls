@@ -19,6 +19,8 @@ const VIDEO_FORMAT =
   "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b";
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_DOWNLOAD_LABEL = "100M";
+const MAX_CONCURRENT_DOWNLOADS = 2;
+const MAX_QUEUE_SIZE = 10;
 
 // =======================================================
 
@@ -31,6 +33,40 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 const ytDlpWrap = new YTDlpWrap(YTDLP_BINARY_PATH);
 
 // ==================== UTIL ====================
+const downloadQueue = [];
+let activeDownloads = 0;
+
+function processDownloadQueue() {
+  while (
+    activeDownloads < MAX_CONCURRENT_DOWNLOADS &&
+    downloadQueue.length > 0
+  ) {
+    const item = downloadQueue.shift();
+    activeDownloads += 1;
+    Promise.resolve()
+      .then(item.task)
+      .then(item.resolve)
+      .catch(item.reject)
+      .finally(() => {
+        activeDownloads -= 1;
+        processDownloadQueue();
+      });
+  }
+}
+
+function enqueueDownload(task) {
+  return new Promise((resolve, reject) => {
+    if (downloadQueue.length >= MAX_QUEUE_SIZE) {
+      const erro = new Error("Fila cheia");
+      erro.code = "QUEUE_FULL";
+      return reject(erro);
+    }
+
+    downloadQueue.push({ task, resolve, reject });
+    processDownloadQueue();
+  });
+}
+
 function isYoutubeLink(url) {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//.test(url);
 }
@@ -107,192 +143,233 @@ app.get("/search", async (req, res) => {
  * Inicia download
  */
 app.post("/download", async (req, res) => {
-  const { link, type } = req.body;
-
-  if (!link) {
-    return res.status(400).json({
-      sucesso: false,
-      mensagem: "❌ O campo 'link' é obrigatório.",
-    });
-  }
-
-  if (!isYoutubeLink(link)) {
-    return res.status(400).json({
-      sucesso: false,
-      mensagem: "❌ O link informado não é do YouTube.",
-    });
-  }
-
-  if (!fs.existsSync(YTDLP_BINARY_PATH)) {
-    return res.status(500).json({
-      sucesso: false,
-      mensagem: "❌ yt-dlp não encontrado. Execute o install.js.",
-    });
-  }
-
-  if (!fs.existsSync(COOKIES_PATH)) {
-    return res.status(500).json({
-      sucesso: false,
-      mensagem: "❌ Arquivo cookies.txt não encontrado.",
-    });
-  }
-
-  const tipoSaida = type === "audio" ? "audio" : "video";
-  console.log(`⬇️ Iniciando download (${tipoSaida}):`, link);
-
-  let arquivoFinal = null;
-  let videoInfo = null;
-  let processoErro = null;
-  const startedAt = Date.now();
-
   try {
-    try {
-      const infoRaw = await ytDlpWrap.execPromise([
-        link,
-        "--dump-single-json",
-        "--skip-download",
-        "--no-playlist",
-        "--cookies",
-        COOKIES_PATH,
-        "--js-runtimes",
-        "node",
-        "--no-warnings",
-      ]);
-      videoInfo = JSON.parse(infoRaw);
-    } catch (infoErro) {
-      console.warn(
-        "⚠️ Não foi possível obter metadados do vídeo:",
-        infoErro.message
-      );
-    }
+    await enqueueDownload(async () => {
+      const { link, type, request_id: requestIdRaw } = req.body;
+      const requestId = String(requestIdRaw || "").trim();
 
-    const args = [
-      link,
-
-      // Cookies e runtime JS
-      "--cookies",
-      COOKIES_PATH,
-      "--js-runtimes",
-      "node",
-
-      // Template de saída (NÃO adivinhamos nome)
-      "-o",
-      path.join(DOWNLOADS_DIR, "%(title)s.%(ext)s"),
-
-      // Retorna o caminho real do arquivo final
-      "--print",
-      "after_postprocess:%(filepath)s",
-      "--print",
-      "after_move:%(filepath)s",
-
-      "--no-warnings",
-      "--max-filesize",
-      MAX_DOWNLOAD_LABEL,
-    ];
-
-    if (tipoSaida === "audio") {
-      args.push("-x", "--audio-format", "mp3");
-    } else {
-      args.push("-f", VIDEO_FORMAT, "--merge-output-format", "mp4");
-    }
-
-    const processo = ytDlpWrap.exec(args);
-
-    processo.on("progress", (p) => {
-      console.log(`📥 ${p.percent || 0}%`);
-    });
-
-    processo.on("ytDlpEvent", (tipo, data) => {
-      if (tipo === "after_postprocess" || tipo === "after_move") {
-        arquivoFinal = data.trim();
-        console.log("📁 Arquivo final:", arquivoFinal);
-      }
-    });
-
-    processo.on("error", (erro) => {
-      processoErro = erro.stderr || erro.message || null;
-      console.error("❌ Erro yt-dlp:", processoErro);
-    });
-
-    processo.on("close", () => {
-      if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
-        const arquivos = fs
-          .readdirSync(DOWNLOADS_DIR)
-          .map((nome) => {
-            const fullPath = path.join(DOWNLOADS_DIR, nome);
-            const stat = fs.statSync(fullPath);
-            return { fullPath, mtimeMs: stat.mtimeMs };
-          })
-          .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-        const recentes = arquivos.filter(
-          (item) => item.mtimeMs >= startedAt - 60000
-        );
-
-        if (recentes.length > 0) {
-          arquivoFinal = recentes[0].fullPath;
-          console.log("📁 Arquivo final (fallback):", arquivoFinal);
-        } else if (arquivos.length > 0) {
-          arquivoFinal = arquivos[0].fullPath;
-          console.log("📁 Arquivo final (fallback):", arquivoFinal);
-        } else {
-          console.error("❌ Download finalizou mas arquivo não encontrado");
-        }
-      }
-    });
-
-    // Aguarda finalizar
-    await new Promise((resolve) => processo.on("close", resolve));
-
-    if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
-      const excedeuLimite =
-        processoErro && /max-filesize|file is larger than/i.test(processoErro);
-      if (excedeuLimite) {
-        return res.status(413).json({
+      if (!link) {
+        return res.status(400).json({
           sucesso: false,
-          mensagem: "❌ Arquivo excede o limite de 100MB.",
+          mensagem: "❌ O campo 'link' é obrigatório.",
         });
       }
 
-      return res.status(500).json({
-        sucesso: false,
-        mensagem: "❌ Download finalizou, mas o arquivo não foi localizado.",
-      });
-    }
+      if (!requestId) {
+        return res.status(400).json({
+          sucesso: false,
+          mensagem: "❌ O campo 'request_id' é obrigatório.",
+        });
+      }
 
-    const tamanhoFinal = fs.statSync(arquivoFinal).size;
-    if (tamanhoFinal > MAX_DOWNLOAD_BYTES) {
-      fs.unlinkSync(arquivoFinal);
-      return res.status(413).json({
-        sucesso: false,
-        mensagem: "❌ Arquivo excede o limite de 100MB.",
-      });
-    }
+      if (!/^[a-zA-Z0-9_-]+$/.test(requestId)) {
+        return res.status(400).json({
+          sucesso: false,
+          mensagem:
+            "❌ O 'request_id' deve conter apenas letras, números, '_' ou '-'.",
+        });
+      }
 
-    if (tipoSaida === "video") {
-      const temAudio = await hasAudioStream(arquivoFinal);
-      if (!temAudio) {
+      if (!isYoutubeLink(link)) {
+        return res.status(400).json({
+          sucesso: false,
+          mensagem: "❌ O link informado não é do YouTube.",
+        });
+      }
+
+      if (!fs.existsSync(YTDLP_BINARY_PATH)) {
         return res.status(500).json({
           sucesso: false,
-          mensagem: "❌ O vídeo baixado não contém faixa de áudio.",
+          mensagem: "❌ yt-dlp não encontrado. Execute o install.js.",
         });
       }
-    }
 
-    const nomeArquivo = path.basename(arquivoFinal);
+      if (!fs.existsSync(COOKIES_PATH)) {
+        return res.status(500).json({
+          sucesso: false,
+          mensagem: "❌ Arquivo cookies.txt não encontrado.",
+        });
+      }
 
-    return res.json({
-      sucesso: true,
-      mensagem: "✅ Download concluído com sucesso!",
-      video_info: videoInfo,
-      stream_url: `http://${HOST}:${PORT}/stream/${encodeURIComponent(
-        nomeArquivo
-      )}`,
+      const tipoSaida = type === "audio" ? "audio" : "video";
+      console.log(`⬇️ Iniciando download (${tipoSaida}):`, link);
+
+      let arquivoFinal = null;
+      let videoInfo = null;
+      let processoErro = null;
+      const startedAt = Date.now();
+
+      try {
+        const requestDir = path.join(DOWNLOADS_DIR, requestId);
+        if (!fs.existsSync(requestDir)) {
+          fs.mkdirSync(requestDir, { recursive: true });
+        }
+
+        try {
+          const infoRaw = await ytDlpWrap.execPromise([
+            link,
+            "--dump-single-json",
+            "--skip-download",
+            "--no-playlist",
+            "--cookies",
+            COOKIES_PATH,
+            "--js-runtimes",
+            "node",
+            "--no-warnings",
+          ]);
+          videoInfo = JSON.parse(infoRaw);
+        } catch (infoErro) {
+          console.warn(
+            "⚠️ Não foi possível obter metadados do vídeo:",
+            infoErro.message
+          );
+        }
+
+        const args = [
+          link,
+
+          // Cookies e runtime JS
+          "--cookies",
+          COOKIES_PATH,
+          "--js-runtimes",
+          "node",
+
+          // Template de saída (NÃO adivinhamos nome)
+          "-o",
+          path.join(requestDir, "%(title)s.%(ext)s"),
+
+          // Retorna o caminho real do arquivo final
+          "--print",
+          "after_postprocess:%(filepath)s",
+          "--print",
+          "after_move:%(filepath)s",
+
+          "--no-warnings",
+          "--max-filesize",
+          MAX_DOWNLOAD_LABEL,
+        ];
+
+        if (tipoSaida === "audio") {
+          args.push("-x", "--audio-format", "mp3");
+        } else {
+          args.push("-f", VIDEO_FORMAT, "--merge-output-format", "mp4");
+        }
+
+        const processo = ytDlpWrap.exec(args);
+
+        processo.on("progress", (p) => {
+          console.log(`📥 ${p.percent || 0}%`);
+        });
+
+        processo.on("ytDlpEvent", (tipo, data) => {
+          if (tipo === "after_postprocess" || tipo === "after_move") {
+            arquivoFinal = data.trim();
+            console.log("📁 Arquivo final:", arquivoFinal);
+          }
+        });
+
+        processo.on("error", (erro) => {
+          processoErro = erro.stderr || erro.message || null;
+          console.error("❌ Erro yt-dlp:", processoErro);
+        });
+
+        processo.on("close", () => {
+          if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
+            const arquivos = fs
+              .readdirSync(requestDir)
+              .map((nome) => {
+                const fullPath = path.join(requestDir, nome);
+                const stat = fs.statSync(fullPath);
+                return { fullPath, mtimeMs: stat.mtimeMs };
+              })
+              .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+            const recentes = arquivos.filter(
+              (item) => item.mtimeMs >= startedAt - 60000
+            );
+
+            if (recentes.length > 0) {
+              arquivoFinal = recentes[0].fullPath;
+              console.log("📁 Arquivo final (fallback):", arquivoFinal);
+            } else if (arquivos.length > 0) {
+              arquivoFinal = arquivos[0].fullPath;
+              console.log("📁 Arquivo final (fallback):", arquivoFinal);
+            } else {
+              console.error("❌ Download finalizou mas arquivo não encontrado");
+            }
+          }
+        });
+
+        // Aguarda finalizar
+        await new Promise((resolve) => processo.on("close", resolve));
+
+        if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
+          const excedeuLimite =
+            processoErro &&
+            /max-filesize|file is larger than/i.test(processoErro);
+          if (excedeuLimite) {
+            return res.status(413).json({
+              sucesso: false,
+              mensagem: "❌ Arquivo excede o limite de 100MB.",
+            });
+          }
+
+          return res.status(500).json({
+            sucesso: false,
+            mensagem: "❌ Download finalizou, mas o arquivo não foi localizado.",
+          });
+        }
+
+        const tamanhoFinal = fs.statSync(arquivoFinal).size;
+        if (tamanhoFinal > MAX_DOWNLOAD_BYTES) {
+          fs.unlinkSync(arquivoFinal);
+          return res.status(413).json({
+            sucesso: false,
+            mensagem: "❌ Arquivo excede o limite de 100MB.",
+          });
+        }
+
+        if (tipoSaida === "video") {
+          const temAudio = await hasAudioStream(arquivoFinal);
+          if (!temAudio) {
+            return res.status(500).json({
+              sucesso: false,
+              mensagem: "❌ O vídeo baixado não contém faixa de áudio.",
+            });
+          }
+        }
+
+        const nomeArquivo = path.basename(arquivoFinal);
+
+        return res.json({
+          sucesso: true,
+          mensagem: "✅ Download concluído com sucesso!",
+          video_info: videoInfo,
+          stream_url: `http://${HOST}:${PORT}/stream/${encodeURIComponent(
+            requestId
+          )}/${encodeURIComponent(
+            nomeArquivo
+          )}`,
+        });
+      } catch (erro) {
+        return res.status(500).json({
+          sucesso: false,
+          mensagem: "❌ Erro ao executar yt-dlp.",
+          erro: erro.message,
+        });
+      }
     });
   } catch (erro) {
+    if (erro && erro.code === "QUEUE_FULL") {
+      return res.status(429).json({
+        sucesso: false,
+        mensagem: "❌ Fila de downloads cheia. Tente novamente mais tarde.",
+      });
+    }
+
     return res.status(500).json({
       sucesso: false,
-      mensagem: "❌ Erro ao executar yt-dlp.",
+      mensagem: "❌ Erro ao enfileirar o download.",
       erro: erro.message,
     });
   }
@@ -304,6 +381,52 @@ app.post("/download", async (req, res) => {
 app.get("/stream/:arquivo", (req, res) => {
   const arquivo = decodeURIComponent(req.params.arquivo);
   const caminho = path.join(DOWNLOADS_DIR, arquivo);
+
+  if (!fs.existsSync(caminho)) {
+    return res.status(404).json({
+      sucesso: false,
+      mensagem: "❌ Arquivo não encontrado.",
+    });
+  }
+
+  const stat = fs.statSync(caminho);
+  const range = req.headers.range;
+
+  if (range) {
+    const [start, end] = range.replace(/bytes=/, "").split("-");
+    const inicio = parseInt(start, 10);
+    const fim = end ? parseInt(end, 10) : stat.size - 1;
+
+    const stream = fs.createReadStream(caminho, {
+      start: inicio,
+      end: fim,
+    });
+
+    res.writeHead(206, {
+      "Content-Range": `bytes ${inicio}-${fim}/${stat.size}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": fim - inicio + 1,
+      "Content-Type": "video/mp4",
+    });
+
+    stream.pipe(res);
+  } else {
+    res.writeHead(200, {
+      "Content-Length": stat.size,
+      "Content-Type": "video/mp4",
+    });
+
+    fs.createReadStream(caminho).pipe(res);
+  }
+});
+
+/**
+ * Streaming de vídeo por request_id (suporte a Range)
+ */
+app.get("/stream/:requestId/:arquivo", (req, res) => {
+  const requestId = decodeURIComponent(req.params.requestId);
+  const arquivo = decodeURIComponent(req.params.arquivo);
+  const caminho = path.join(DOWNLOADS_DIR, requestId, arquivo);
 
   if (!fs.existsSync(caminho)) {
     return res.status(404).json({
