@@ -74,9 +74,30 @@ app.post("/download", async (req, res) => {
   console.log("⬇️ Iniciando download:", link);
 
   let arquivoFinal = null;
+  let videoInfo = null;
   const startedAt = Date.now();
 
   try {
+    try {
+      const infoRaw = await ytDlpWrap.execPromise([
+        link,
+        "--dump-single-json",
+        "--skip-download",
+        "--no-playlist",
+        "--cookies",
+        COOKIES_PATH,
+        "--js-runtimes",
+        "node",
+        "--no-warnings",
+      ]);
+      videoInfo = JSON.parse(infoRaw);
+    } catch (infoErro) {
+      console.warn(
+        "⚠️ Não foi possível obter metadados do vídeo:",
+        infoErro.message
+      );
+    }
+
     const processo = ytDlpWrap.exec([
       link,
 
@@ -129,10 +150,16 @@ app.post("/download", async (req, res) => {
             const stat = fs.statSync(fullPath);
             return { fullPath, mtimeMs: stat.mtimeMs };
           })
-          .filter((item) => item.mtimeMs >= startedAt - 1000)
           .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-        if (arquivos.length > 0) {
+        const recentes = arquivos.filter(
+          (item) => item.mtimeMs >= startedAt - 60000
+        );
+
+        if (recentes.length > 0) {
+          arquivoFinal = recentes[0].fullPath;
+          console.log("📁 Arquivo final (fallback):", arquivoFinal);
+        } else if (arquivos.length > 0) {
           arquivoFinal = arquivos[0].fullPath;
           console.log("📁 Arquivo final (fallback):", arquivoFinal);
         } else {
@@ -156,6 +183,7 @@ app.post("/download", async (req, res) => {
     return res.json({
       sucesso: true,
       mensagem: "✅ Download concluído com sucesso!",
+      video_info: videoInfo,
       stream_url: `http://${HOST}:${PORT}/stream/${encodeURIComponent(
         nomeArquivo
       )}`,
