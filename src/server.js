@@ -17,6 +17,8 @@ const COOKIES_PATH = path.join(ROOT_DIR, "cookies.txt");
 const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
 const VIDEO_FORMAT =
   "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b";
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_DOWNLOAD_LABEL = "100M";
 
 // =======================================================
 
@@ -140,6 +142,7 @@ app.post("/download", async (req, res) => {
 
   let arquivoFinal = null;
   let videoInfo = null;
+  let processoErro = null;
   const startedAt = Date.now();
 
   try {
@@ -183,6 +186,8 @@ app.post("/download", async (req, res) => {
       "after_move:%(filepath)s",
 
       "--no-warnings",
+      "--max-filesize",
+      MAX_DOWNLOAD_LABEL,
     ];
 
     if (tipoSaida === "audio") {
@@ -205,7 +210,8 @@ app.post("/download", async (req, res) => {
     });
 
     processo.on("error", (erro) => {
-      console.error("❌ Erro yt-dlp:", erro.stderr || erro.message);
+      processoErro = erro.stderr || erro.message || null;
+      console.error("❌ Erro yt-dlp:", processoErro);
     });
 
     processo.on("close", () => {
@@ -239,9 +245,27 @@ app.post("/download", async (req, res) => {
     await new Promise((resolve) => processo.on("close", resolve));
 
     if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
+      const excedeuLimite =
+        processoErro && /max-filesize|file is larger than/i.test(processoErro);
+      if (excedeuLimite) {
+        return res.status(413).json({
+          sucesso: false,
+          mensagem: "❌ Arquivo excede o limite de 100MB.",
+        });
+      }
+
       return res.status(500).json({
         sucesso: false,
         mensagem: "❌ Download finalizou, mas o arquivo não foi localizado.",
+      });
+    }
+
+    const tamanhoFinal = fs.statSync(arquivoFinal).size;
+    if (tamanhoFinal > MAX_DOWNLOAD_BYTES) {
+      fs.unlinkSync(arquivoFinal);
+      return res.status(413).json({
+        sucesso: false,
+        mensagem: "❌ Arquivo excede o limite de 100MB.",
       });
     }
 
