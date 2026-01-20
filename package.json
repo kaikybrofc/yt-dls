@@ -11,7 +11,11 @@
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "install:yt-dlp": "node scripts/install.js",
-    "test:request": "node scripts/test-request.js"
+    "test:request": "node scripts/test-request.js",
+    "start:pm2": "pm2 start src/server.js --name yt-dls",
+    "stop:pm2": "pm2 stop yt-dls",
+    "restart:pm2": "pm2 restart yt-dls",
+    "delete:pm2": "pm2 delete yt-dls"
   },
   "repository": {
     "type": "git",
