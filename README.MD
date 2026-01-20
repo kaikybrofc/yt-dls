@@ -126,7 +126,48 @@ Resposta:
 
 ---
 
-### 🔹 Download de vídeo
+### 🔹 Buscar vídeo por nome
+
+```http
+GET /search?q=termodebusca
+```
+
+Resposta (quando encontra):
+
+```json
+{
+  "sucesso": true,
+  "total": 1,
+  "resultado": {
+    "id": "VIDEO_ID",
+    "title": "Titulo do video",
+    "url": "https://www.youtube.com/watch?v=VIDEO_ID"
+  }
+}
+```
+
+Resposta (quando não encontra):
+
+```json
+{
+  "sucesso": true,
+  "total": 0,
+  "resultado": null
+}
+```
+
+Erros:
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ O parâmetro 'q' é obrigatório."
+}
+```
+
+---
+
+### 🔹 Download de vídeo ou áudio
 
 ```http
 POST /download
@@ -137,7 +178,8 @@ Body:
 
 ```json
 {
-  "link": "https://youtu.be/VIDEO_ID"
+  "link": "https://youtu.be/VIDEO_ID",
+  "type": "video"
 }
 ```
 
@@ -148,10 +190,20 @@ Body:
 ```json
 {
   "sucesso": true,
-  "mensagem": "📥 Download iniciado com sucesso.",
-  "arquivo": "video-1700000000000.mp4"
+  "mensagem": "✅ Download concluído com sucesso!",
+  "video_info": {
+    "id": "VIDEO_ID",
+    "title": "Titulo do video"
+  },
+  "stream_url": "http://127.0.0.1:3000/stream/NOME_DO_ARQUIVO.mp4"
 }
 ```
+
+Observações:
+
+* `type` é opcional: `video` (padrão) ou `audio`
+* Quando `type = audio`, o arquivo final é `.mp3`
+* `video_info` pode ser `null` se o metadata falhar
 
 ---
 
@@ -174,6 +226,44 @@ Cookies ausentes:
   "mensagem": "❌ Arquivo cookies.txt não encontrado."
 }
 ```
+
+Vídeo sem faixa de áudio:
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ O vídeo baixado não contém faixa de áudio."
+}
+```
+
+Arquivo final não localizado:
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ Download finalizou, mas o arquivo não foi localizado."
+}
+```
+
+---
+
+### 🔹 Streaming do arquivo baixado
+
+```http
+GET /stream/:arquivo
+```
+
+Exemplo:
+
+```http
+GET /stream/Meu%20Video.mp4
+Range: bytes=0-
+```
+
+Notas:
+
+* Suporta `Range` para streaming progressivo
+* O arquivo deve existir na pasta `downloads/`
 
 ---
 

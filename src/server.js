@@ -2,6 +2,7 @@ const express = require("express");
 const YTDlpWrap = require("yt-dlp-wrap").default;
 const path = require("path");
 const fs = require("fs");
+const { execFile } = require("child_process");
 
 const app = express();
 app.use(express.json());
@@ -14,6 +15,8 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const YTDLP_BINARY_PATH = path.join(ROOT_DIR, "bin", "yt-dlp");
 const COOKIES_PATH = path.join(ROOT_DIR, "cookies.txt");
 const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
+const VIDEO_FORMAT =
+  "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b";
 
 // =======================================================
 
@@ -28,6 +31,29 @@ const ytDlpWrap = new YTDlpWrap(YTDLP_BINARY_PATH);
 // ==================== UTIL ====================
 function isYoutubeLink(url) {
   return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//.test(url);
+}
+
+function hasAudioStream(filePath) {
+  return new Promise((resolve) => {
+    execFile(
+      "ffprobe",
+      [
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=nk=1:nw=1",
+        filePath,
+      ],
+      (erro, stdout) => {
+        if (erro) return resolve(false);
+        resolve(stdout.trim().length > 0);
+      }
+    );
+  });
 }
 
 // ==================== ROTAS ====================
@@ -79,7 +105,7 @@ app.get("/search", async (req, res) => {
  * Inicia download
  */
 app.post("/download", async (req, res) => {
-  const { link } = req.body;
+  const { link, type } = req.body;
 
   if (!link) {
     return res.status(400).json({
@@ -109,7 +135,8 @@ app.post("/download", async (req, res) => {
     });
   }
 
-  console.log("⬇️ Iniciando download:", link);
+  const tipoSaida = type === "audio" ? "audio" : "video";
+  console.log(`⬇️ Iniciando download (${tipoSaida}):`, link);
 
   let arquivoFinal = null;
   let videoInfo = null;
@@ -136,7 +163,7 @@ app.post("/download", async (req, res) => {
       );
     }
 
-    const processo = ytDlpWrap.exec([
+    const args = [
       link,
 
       // Cookies e runtime JS
@@ -144,12 +171,6 @@ app.post("/download", async (req, res) => {
       COOKIES_PATH,
       "--js-runtimes",
       "node",
-
-      // Melhor vídeo + áudio
-      "-f",
-      "bv*+ba/b",
-      "--merge-output-format",
-      "mp4",
 
       // Template de saída (NÃO adivinhamos nome)
       "-o",
@@ -162,7 +183,15 @@ app.post("/download", async (req, res) => {
       "after_move:%(filepath)s",
 
       "--no-warnings",
-    ]);
+    ];
+
+    if (tipoSaida === "audio") {
+      args.push("-x", "--audio-format", "mp3");
+    } else {
+      args.push("-f", VIDEO_FORMAT, "--merge-output-format", "mp4");
+    }
+
+    const processo = ytDlpWrap.exec(args);
 
     processo.on("progress", (p) => {
       console.log(`📥 ${p.percent || 0}%`);
@@ -214,6 +243,16 @@ app.post("/download", async (req, res) => {
         sucesso: false,
         mensagem: "❌ Download finalizou, mas o arquivo não foi localizado.",
       });
+    }
+
+    if (tipoSaida === "video") {
+      const temAudio = await hasAudioStream(arquivoFinal);
+      if (!temAudio) {
+        return res.status(500).json({
+          sucesso: false,
+          mensagem: "❌ O vídeo baixado não contém faixa de áudio.",
+        });
+      }
     }
 
     const nomeArquivo = path.basename(arquivoFinal);

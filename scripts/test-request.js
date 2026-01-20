@@ -18,7 +18,7 @@ async function main() {
     const downloadRes = await fetch(`${API_URL}/download`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ link: YT_LINK }),
+      body: JSON.stringify({ link: YT_LINK, type: "video" }),
     });
 
     const downloadJson = await downloadRes.json();
