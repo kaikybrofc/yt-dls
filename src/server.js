@@ -38,6 +38,44 @@ app.get("/", (req, res) => {
 });
 
 /**
+ * Busca vídeos por nome
+ */
+app.get("/search", async (req, res) => {
+  const query = String(req.query.q || "").trim();
+
+  if (!query) {
+    return res.status(400).json({
+      sucesso: false,
+      mensagem: "❌ O parâmetro 'q' é obrigatório.",
+    });
+  }
+
+  try {
+    const infoRaw = await ytDlpWrap.execPromise([
+      `ytsearch1:${query}`,
+      "--dump-single-json",
+      "--skip-download",
+      "--flat-playlist",
+      "--no-warnings",
+    ]);
+    const info = JSON.parse(infoRaw);
+    const primeiro = info.entries && info.entries.length > 0 ? info.entries[0] : null;
+
+    return res.json({
+      sucesso: true,
+      total: primeiro ? 1 : 0,
+      resultado: primeiro,
+    });
+  } catch (erro) {
+    return res.status(500).json({
+      sucesso: false,
+      mensagem: "❌ Erro ao buscar vídeos.",
+      erro: erro.message,
+    });
+  }
+});
+
+/**
  * Inicia download
  */
 app.post("/download", async (req, res) => {
