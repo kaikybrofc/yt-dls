@@ -10,9 +10,10 @@ app.use(express.json());
 const HOST = "127.0.0.1";
 const PORT = 3000;
 
-const YTDLP_BINARY_PATH = path.join(__dirname, "bin", "yt-dlp");
-const COOKIES_PATH = path.join(__dirname, "cookies.txt");
-const DOWNLOADS_DIR = path.join(__dirname, "downloads");
+const ROOT_DIR = path.resolve(__dirname, "..");
+const YTDLP_BINARY_PATH = path.join(ROOT_DIR, "bin", "yt-dlp");
+const COOKIES_PATH = path.join(ROOT_DIR, "cookies.txt");
+const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
 
 // =======================================================
 

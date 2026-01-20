@@ -35,8 +35,11 @@ Projeto focado em:
 
 ```text
 yt-dls/
-├─ server.js        # API principal
-├─ install.js       # Script de instalação do yt-dlp
+├─ src/
+│  └─ server.js     # API principal
+├─ scripts/
+│  ├─ install.js    # Script de instalação do yt-dlp
+│  └─ test-request.js # Teste da API
 ├─ package.json
 ├─ cookies.txt      # Cookies do YouTube (formato Netscape)
 ├─ bin/

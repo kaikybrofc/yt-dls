@@ -15,7 +15,7 @@ async function instalarYtDlp() {
   console.log("📥 Iniciando instalação do yt-dlp...");
 
   // Pasta onde o binário será salvo
-  const pastaBin = path.join(__dirname, "bin");
+  const pastaBin = path.join(__dirname, "..", "bin");
   const caminhoBinario = path.join(pastaBin, "yt-dlp");
 
   // Cria a pasta ./bin se não existir
