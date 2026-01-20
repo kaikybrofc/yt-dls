@@ -1,7 +1,7 @@
 const API_URL = process.env.API_URL || "http://127.0.0.1:3000";
 const YT_LINK =
   process.env.YT_LINK || "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-const SEARCH_QUERY = process.env.SEARCH_QUERY || "rick astley never gonna give you up";
+const SEARCH_QUERY = "rick astley never gonna give you up";
 
 async function main() {
   try {
