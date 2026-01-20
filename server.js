@@ -7,6 +7,7 @@ const app = express();
 app.use(express.json());
 
 // ==================== CONFIGURAÇÕES ====================
+const HOST = "127.0.0.1";
 const PORT = 3000;
 
 const YTDLP_BINARY_PATH = path.join(__dirname, "bin", "yt-dlp");
@@ -72,6 +73,7 @@ app.post("/download", async (req, res) => {
   console.log("⬇️ Iniciando download:", link);
 
   let arquivoFinal = null;
+  const startedAt = Date.now();
 
   try {
     const processo = ytDlpWrap.exec([
@@ -119,7 +121,22 @@ app.post("/download", async (req, res) => {
 
     processo.on("close", () => {
       if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
-        console.error("❌ Download finalizou mas arquivo não encontrado");
+        const arquivos = fs
+          .readdirSync(DOWNLOADS_DIR)
+          .map((nome) => {
+            const fullPath = path.join(DOWNLOADS_DIR, nome);
+            const stat = fs.statSync(fullPath);
+            return { fullPath, mtimeMs: stat.mtimeMs };
+          })
+          .filter((item) => item.mtimeMs >= startedAt - 1000)
+          .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+        if (arquivos.length > 0) {
+          arquivoFinal = arquivos[0].fullPath;
+          console.log("📁 Arquivo final (fallback):", arquivoFinal);
+        } else {
+          console.error("❌ Download finalizou mas arquivo não encontrado");
+        }
       }
     });
 
@@ -138,7 +155,7 @@ app.post("/download", async (req, res) => {
     return res.json({
       sucesso: true,
       mensagem: "✅ Download concluído com sucesso!",
-      stream_url: `https://omnizap.shop/stream/${encodeURIComponent(
+      stream_url: `http://${HOST}:${PORT}/stream/${encodeURIComponent(
         nomeArquivo
       )}`,
     });
@@ -197,6 +214,6 @@ app.get("/stream/:arquivo", (req, res) => {
 });
 
 // ==================== START ====================
-app.listen(PORT, () => {
-  console.log(`🚀 API rodando em http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 API rodando em http://${HOST}:${PORT}`);
 });
