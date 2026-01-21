@@ -2,31 +2,27 @@ const express = require("express");
 const YTDlpWrap = require("yt-dlp-wrap").default;
 const path = require("path");
 const fs = require("fs");
-const { execFile, spawn } = require("child_process");
+const {
+  HOST,
+  PORT,
+  YTDLP_BINARY_PATH,
+  COOKIES_PATH,
+  DOWNLOADS_DIR,
+  VIDEO_FORMAT,
+  MAX_DOWNLOAD_BYTES,
+  MAX_DOWNLOAD_LABEL,
+  MAX_CONCURRENT_DOWNLOADS,
+  MAX_QUEUE_SIZE,
+  MAX_CONCURRENT_FFMPEG,
+  CONVERT_TIMEOUT_MS,
+} = require("./config");
+const { Semaphore } = require("./utils/semaphore");
+const { isYoutubeLink, isValidRequestId } = require("./utils/validators");
+const { createMediaConverter, hasAudioStream } = require("./utils/media");
+const { streamFileResponse } = require("./utils/stream");
 
 const app = express();
 app.use(express.json());
-
-// ==================== CONFIGURAÇÕES ====================
-const HOST = "127.0.0.1";
-const PORT = 3000;
-
-const ROOT_DIR = path.resolve(__dirname, "..");
-const YTDLP_BINARY_PATH = path.join(ROOT_DIR, "bin", "yt-dlp");
-const COOKIES_PATH = path.join(ROOT_DIR, "cookies.txt");
-const DOWNLOADS_DIR = path.join(ROOT_DIR, "downloads");
-const VIDEO_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b";
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
-const MAX_DOWNLOAD_LABEL = "100M";
-const MAX_CONCURRENT_DOWNLOADS = 4;
-const MAX_QUEUE_SIZE = 10;
-const MAX_CONCURRENT_FFMPEG = Number.parseInt(
-  process.env.MAX_CONCURRENT_FFMPEG || "1",
-  10,
-);
-const CONVERT_TIMEOUT_MS = 300000;
-
-// =======================================================
 
 // Garante pasta de downloads
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -37,284 +33,15 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 const ytDlpWrap = new YTDlpWrap(YTDLP_BINARY_PATH);
 
 // ==================== UTIL ====================
-class Semaphore {
-  constructor(limit, maxQueue = 0) {
-    this.limit = Math.max(1, Number.isFinite(limit) ? limit : 1);
-    this.maxQueue = Math.max(0, Number.isFinite(maxQueue) ? maxQueue : 0);
-    this.active = 0;
-    this.activeIds = new Set();
-    this.queue = [];
-  }
-
-  getStats() {
-    return {
-      active: this.active,
-      queued: this.queue.length,
-      limit: this.limit,
-      maxQueue: this.maxQueue,
-    };
-  }
-
-  run(task, meta = {}) {
-    return new Promise((resolve, reject) => {
-      const ahead = this.active + this.queue.length;
-      const execute = async () => {
-        this.active += 1;
-        if (meta.requestId) {
-          this.activeIds.add(meta.requestId);
-        }
-        console.log(
-          `🧵 Fila: iniciando job ${meta.requestId || "desconhecido"} | ativos=${this.active} | fila=${this.queue.length}`,
-        );
-        try {
-          resolve(await task({ queueAhead: ahead, queueStats: this.getStats() }));
-        } catch (error) {
-          reject(error);
-        } finally {
-          this.active -= 1;
-          if (meta.requestId) {
-            this.activeIds.delete(meta.requestId);
-          }
-          console.log(
-            `✅ Fila: finalizou job ${meta.requestId || "desconhecido"} | ativos=${this.active} | fila=${this.queue.length}`,
-          );
-          const next = this.queue.shift();
-          if (next) next.execute();
-        }
-      };
-
-      if (this.maxQueue > 0 && this.queue.length >= this.maxQueue) {
-        const erro = new Error("Fila cheia");
-        erro.code = "QUEUE_FULL";
-        erro.stats = this.getStats();
-        return reject(erro);
-      }
-
-      if (this.active < this.limit) {
-        execute();
-      } else {
-        this.queue.push({ execute, requestId: meta.requestId || null });
-        console.log(
-          `📥 Fila: enfileirado job ${meta.requestId || "desconhecido"} | ativos=${this.active} | fila=${this.queue.length}`,
-        );
-      }
-    });
-  }
-
-  getQueueInfo(requestId) {
-    if (!requestId) return null;
-    if (this.activeIds.has(requestId)) {
-      return {
-        status: "active",
-        downloads_a_frente: 0,
-        enfileirados: this.queue.length,
-      };
-    }
-    const index = this.queue.findIndex((item) => item.requestId === requestId);
-    if (index === -1) return null;
-    return {
-      status: "queued",
-      downloads_a_frente: this.active + index,
-      posicao_na_fila: index + 1,
-      enfileirados: this.queue.length,
-    };
-  }
-}
-
 const downloadSemaphore = new Semaphore(
   MAX_CONCURRENT_DOWNLOADS,
   MAX_QUEUE_SIZE,
 );
 const ffmpegSemaphore = new Semaphore(MAX_CONCURRENT_FFMPEG, 0);
-
-function isYoutubeLink(url) {
-  return /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\//.test(url);
-}
-
-function hasAudioStream(filePath) {
-  return new Promise((resolve) => {
-    execFile(
-      "ffprobe",
-      [
-        "-v",
-        "error",
-        "-select_streams",
-        "a:0",
-        "-show_entries",
-        "stream=codec_type",
-        "-of",
-        "default=nk=1:nw=1",
-        filePath,
-      ],
-      (erro, stdout) => {
-        if (erro) return resolve(false);
-        resolve(stdout.trim().length > 0);
-      },
-    );
-  });
-}
-
-function runFfmpeg(args, timeoutMs = CONVERT_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    let finished = false;
-
-    const timer = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      proc.kill("SIGKILL");
-      const error = new Error("FFmpeg excedeu o tempo limite.");
-      error.stderr = stderr;
-      reject(error);
-    }, timeoutMs);
-
-    proc.stderr.on("data", (chunk) => {
-      if (stderr.length < 8000) {
-        stderr += chunk.toString();
-      }
-    });
-
-    proc.on("error", (error) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-
-    proc.on("close", (code) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      if (code === 0) {
-        resolve();
-      } else {
-        const error = new Error(`FFmpeg saiu com codigo ${code}.`);
-        error.stderr = stderr;
-        reject(error);
-      }
-    });
-  });
-}
-
-async function convertMedia(tipoSaida, inputPath, requestDir) {
-  return ffmpegSemaphore.run(async () => {
-    const outputPath =
-      tipoSaida === "audio"
-        ? path.join(
-            requestDir,
-            `audio_${Date.now()}_${Math.random().toString(16).slice(2)}.mp3`,
-          )
-        : path.join(
-            requestDir,
-            `video_${Date.now()}_${Math.random().toString(16).slice(2)}.mp4`,
-          );
-
-    const args =
-      tipoSaida === "audio"
-        ? [
-            "-y",
-            "-i",
-            inputPath,
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-b:a",
-            "128k",
-            "-ar",
-            "44100",
-            "-ac",
-            "2",
-            outputPath,
-          ]
-        : [
-            "-y",
-            "-i",
-            inputPath,
-            "-vf",
-            "scale='min(1280,iw)':-2",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "28",
-            "-c:v",
-            "libx264",
-            "-profile:v",
-            "baseline",
-            "-level",
-            "3.1",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            outputPath,
-          ];
-
-    await runFfmpeg(args);
-    return outputPath;
-  });
-}
-
-function streamFileResponse(
-  res,
-  filePath,
-  contentType,
-  extraHeaders = {},
-  options = {},
-) {
-  const stat = fs.statSync(filePath);
-  res.writeHead(200, {
-    "Content-Length": stat.size,
-    "Content-Type": contentType,
-    "Content-Disposition": `attachment; filename="${path.basename(filePath)}"`,
-    ...extraHeaders,
-  });
-
-  const stream = fs.createReadStream(filePath);
-  if (options.deleteAfterSend) {
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      fs.unlink(filePath, (erro) => {
-        if (erro) {
-          console.warn(`⚠️ Falha ao remover arquivo | ${erro.message}`);
-          return;
-        }
-        if (options.cleanupDir) {
-          fs.readdir(options.cleanupDir, (dirErro, entries) => {
-            if (dirErro) return;
-            if (entries.length === 0) {
-              fs.rmdir(options.cleanupDir, (rmErro) => {
-                if (rmErro) {
-                  console.warn(
-                    `⚠️ Falha ao remover pasta | ${rmErro.message}`,
-                  );
-                }
-              });
-            }
-          });
-        }
-      });
-    };
-
-    res.on("finish", cleanup);
-    res.on("close", cleanup);
-  }
-  stream.on("error", (erro) => {
-    console.error(`❌ Erro ao ler arquivo | ${erro.message}`);
-    if (!res.headersSent) {
-      res.status(500).end();
-    } else {
-      res.end();
-    }
-  });
-  stream.pipe(res);
-}
+const { convertMedia } = createMediaConverter({
+  ffmpegSemaphore,
+  convertTimeoutMs: CONVERT_TIMEOUT_MS,
+});
 
 // ==================== ROTAS ====================
 
@@ -374,8 +101,8 @@ app.post("/download", async (req, res) => {
       async ({ queueAhead: ahead, queueStats }) => {
         queueAhead = ahead;
         queueStatsAtStart = queueStats;
-      const { link, type, request_id: requestIdRaw } = req.body;
-      const requestId = String(requestIdRaw || "").trim();
+        const { link, type, request_id: requestIdRaw } = req.body;
+        const requestId = String(requestIdRaw || "").trim();
 
       console.log(
         `➡️ Requisicao download recebida | request_id=${requestId || "vazio"} | link=${link || "vazio"} | type=${type || "video"}`,
@@ -400,7 +127,7 @@ app.post("/download", async (req, res) => {
         });
       }
 
-      if (!/^[a-zA-Z0-9_-]+$/.test(requestId)) {
+      if (!isValidRequestId(requestId)) {
         console.warn("⚠️ Download rejeitado: request_id invalido");
         return res.status(400).json({
           sucesso: false,
