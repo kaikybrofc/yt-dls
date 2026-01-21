@@ -19,6 +19,8 @@ Projeto focado em:
 * 🧠 Uso de runtime JavaScript exigido pelo YouTube
 * 🌐 API REST simples (`POST /download`)
 * 📁 Organização automática de arquivos
+* 🧵 Fila e limite de concorrência para downloads
+* 🎛️ Conversão via FFmpeg (MP3/MP4)
 
 ---
 
@@ -28,6 +30,7 @@ Projeto focado em:
 * Express
 * yt-dlp
 * yt-dlp-wrap
+* FFmpeg
 
 ---
 
@@ -45,7 +48,8 @@ yt-dls/
 ├─ bin/
 │  └─ yt-dlp        # Binário do yt-dlp
 └─ downloads/
-   └─ video-xxxx.mp4
+   └─ <request_id>/
+      └─ video-xxxx.mp4
 ```
 
 ---
@@ -179,7 +183,8 @@ Body:
 ```json
 {
   "link": "https://youtu.be/VIDEO_ID",
-  "type": "video"
+  "type": "video",
+  "request_id": "meu_id_123"
 }
 ```
 
@@ -187,23 +192,25 @@ Body:
 
 ### ✅ Resposta de sucesso
 
+Retorna o arquivo convertido diretamente (stream do binário).
+Headers relevantes:
+
+- `Content-Type`: `video/mp4` ou `audio/mpeg`
+- `Content-Disposition`: `attachment; filename="..."`
+- `X-Queue-Ahead`: quantos downloads estavam na frente
+- `X-Queue-Limit`: limite de concorrência
+- `X-Request-Id`: request_id usado
+
 ```json
-{
-  "sucesso": true,
-  "mensagem": "✅ Download concluído com sucesso!",
-  "video_info": {
-    "id": "VIDEO_ID",
-    "title": "Titulo do video"
-  },
-  "stream_url": "http://127.0.0.1:3000/stream/NOME_DO_ARQUIVO.mp4"
-}
+<binary>
 ```
 
 Observações:
 
 * `type` é opcional: `video` (padrão) ou `audio`
 * Quando `type = audio`, o arquivo final é `.mp3`
-* `video_info` pode ser `null` se o metadata falhar
+* `request_id` é obrigatório e deve conter apenas letras, números, `_` ou `-`
+* O arquivo é removido após o envio (cleanup automático)
 
 ---
 
@@ -247,6 +254,31 @@ Arquivo final não localizado:
 
 ---
 
+### 🔹 Status da fila por request_id
+
+```http
+GET /download/queue-status/:requestId
+```
+
+Resposta:
+
+```json
+{
+  "sucesso": true,
+  "request_id": "meu_id_123",
+  "fila": {
+    "status": "queued",
+    "downloads_a_frente": 2,
+    "posicao_na_fila": 1,
+    "enfileirados": 3,
+    "limite_concorrencia": 2,
+    "limite_fila": 10
+  }
+}
+```
+
+---
+
 ### 🔹 Streaming do arquivo baixado
 
 ```http
@@ -273,6 +305,7 @@ Notas:
 * ✅ Use sempre cookies no formato Netscape
 * ⚠️ Não exponha sua API publicamente sem autenticação
 * 💡 Ideal para uso interno ou controlado
+* ⚙️ Configure o limite de conversão com `MAX_CONCURRENT_FFMPEG`
 
 ---
 
@@ -280,7 +313,6 @@ Notas:
 
 * 🔄 Status de download
 * 📊 Progresso em tempo real (WebSocket)
-* 🧵 Fila de downloads
 * 🔐 Autenticação por token
 * 🐳 Docker
 
