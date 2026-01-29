@@ -1,26 +1,34 @@
 # yt-dls
 
-API simples e leve para download de vídeos do **YouTube** utilizando **yt-dlp** com **Node.js** e **Express**.
+API leve para download e conversão de mídia do **YouTube** usando **yt-dlp**, **Node.js** e **Express**.
 
 Projeto focado em:
 
-* Facilidade de uso
-* Organização
-* Pronto para VPS / produção
-* Integração via API REST
+* Simplicidade de uso via API
+* Organização por `request_id`
+* Controle de fila e concorrência
+* Saída padronizada em MP3/MP4
 
 ---
 
 ## 🚀 Funcionalidades
 
 * ✅ Download de vídeos do YouTube
-* 🔍 Validação de links (somente YouTube)
+* 🔍 Busca simples por título (`GET /search`)
 * 🔐 Suporte a cookies (anti-bot)
-* 🧠 Uso de runtime JavaScript exigido pelo YouTube
-* 🌐 API REST simples (`POST /download`)
-* 📁 Organização automática de arquivos
-* 🧵 Fila e limite de concorrência para downloads
+* 🧠 Runtime JavaScript exigido pelo YouTube
+* 🧵 Fila e limite de concorrência (download e FFmpeg)
 * 🎛️ Conversão via FFmpeg (MP3/MP4)
+* 📁 Organização automática por `request_id`
+* 📦 Stream direto como resposta do download
+
+---
+
+## ✅ Requisitos
+
+* Node.js instalado
+* FFmpeg + FFprobe disponíveis no PATH
+* Cookies do YouTube em `cookies.txt` (formato Netscape)
 
 ---
 
@@ -30,7 +38,7 @@ Projeto focado em:
 * Express
 * yt-dlp
 * yt-dlp-wrap
-* FFmpeg
+* FFmpeg / FFprobe
 
 ---
 
@@ -39,17 +47,21 @@ Projeto focado em:
 ```text
 yt-dls/
 ├─ src/
-│  └─ server.js     # API principal
+│  ├─ server.js      # API principal
+│  ├─ config.js      # Configurações/limites
+│  └─ utils/
+│     ├─ media.js    # Conversão/FFmpeg
+│     ├─ semaphore.js # Fila/concorrência
+│     ├─ stream.js   # Stream de arquivo
+│     └─ validators.js # Validadores
 ├─ scripts/
-│  ├─ install.js    # Script de instalação do yt-dlp
-│  └─ test-request.js # Teste da API
-├─ package.json
-├─ cookies.txt      # Cookies do YouTube (formato Netscape)
+│  └─ install.js     # Instalação do yt-dlp
 ├─ bin/
-│  └─ yt-dlp        # Binário do yt-dlp
+│  └─ yt-dlp         # Binário do yt-dlp
+├─ cookies.txt       # Cookies do YouTube (Netscape)
 └─ downloads/
    └─ <request_id>/
-      └─ video-xxxx.mp4
+      └─ <arquivo>.mp4 | <arquivo>.mp3
 ```
 
 ---
@@ -79,22 +91,38 @@ npm install
 npm run install:yt-dlp
 ```
 
-Isso irá baixar automaticamente o binário correto do **yt-dlp** para seu sistema.
+Isso baixa automaticamente o binário correto do **yt-dlp** para seu sistema.
 
 ---
 
 ## 🔐 Configuração de cookies (OBRIGATÓRIO)
 
-O YouTube bloqueia downloads sem autenticação em VPS.
+O YouTube bloqueia downloads sem autenticação em vários ambientes (especialmente VPS).
 
-### ✅ Forma correta
+### ✅ Passos
 
 1. Faça login no YouTube pelo navegador
 2. Instale a extensão **Get cookies.txt (LOCALLY)**
 3. Exporte os cookies
-4. Salve o arquivo como `cookies.txt` na raiz do projeto
+4. Salve como `cookies.txt` na raiz do projeto
 
-⚠️ O arquivo **precisa** estar no formato **Netscape**.
+⚠️ O arquivo precisa estar no formato **Netscape**.
+
+---
+
+## ⚙️ Configuração
+
+As configurações ficam em `src/config.js` (por enquanto não há `.env`).
+
+Valores padrão importantes:
+
+* `HOST`: `127.0.0.1`
+* `PORT`: `3000`
+* `MAX_DOWNLOAD_BYTES`: `100MB`
+* `MAX_CONCURRENT_DOWNLOADS`: `4`
+* `MAX_QUEUE_SIZE`: `10`
+* `MAX_CONCURRENT_FFMPEG`: via env (default `1`)
+* `CONVERT_TIMEOUT_MS`: `300000` (5 min)
 
 ---
 
@@ -107,7 +135,16 @@ npm start
 Servidor rodando em:
 
 ```
-http://localhost:3000
+http://127.0.0.1:3000
+```
+
+### PM2 (opcional)
+
+```bash
+npm run start:pm2
+npm run stop:pm2
+npm run restart:pm2
+npm run delete:pm2
 ```
 
 ---
@@ -150,15 +187,7 @@ Resposta (quando encontra):
 }
 ```
 
-Resposta (quando não encontra):
-
-```json
-{
-  "sucesso": true,
-  "total": 0,
-  "resultado": null
-}
-```
+> `resultado` contém o primeiro item retornado pelo `yt-dlp` (estrutura completa do `ytsearch1`).
 
 Erros:
 
@@ -188,33 +217,41 @@ Body:
 }
 ```
 
----
+* `type` é opcional: `video` (padrão) ou `audio`
+* `request_id` é obrigatório e deve conter apenas letras, números, `_` ou `-`
 
-### ✅ Resposta de sucesso
+✅ **Resposta de sucesso**
 
 Retorna o arquivo convertido diretamente (stream do binário).
 Headers relevantes:
 
 - `Content-Type`: `video/mp4` ou `audio/mpeg`
 - `Content-Disposition`: `attachment; filename="..."`
-- `X-Queue-Ahead`: quantos downloads estavam na frente
+- `X-Queue-Ahead`: downloads na frente
 - `X-Queue-Limit`: limite de concorrência
-- `X-Request-Id`: request_id usado
-
-```json
-<binary>
-```
-
-Observações:
-
-* `type` é opcional: `video` (padrão) ou `audio`
-* Quando `type = audio`, o arquivo final é `.mp3`
-* `request_id` é obrigatório e deve conter apenas letras, números, `_` ou `-`
-* O arquivo é removido após o envio (cleanup automático)
+- `X-Request-Id`: `request_id` usado
 
 ---
 
 ### ❌ Erros comuns
+
+Campos obrigatórios:
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ O campo 'link' é obrigatório."
+}
+```
+
+`request_id` inválido:
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ O 'request_id' deve conter apenas letras, números, '_' ou '-'."
+}
+```
 
 Link inválido:
 
@@ -231,6 +268,30 @@ Cookies ausentes:
 {
   "sucesso": false,
   "mensagem": "❌ Arquivo cookies.txt não encontrado."
+}
+```
+
+Fila cheia (HTTP 429):
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ Fila de downloads cheia. Tente novamente mais tarde.",
+  "fila": {
+    "downloads_a_frente": 4,
+    "enfileirados": 10,
+    "limite_concorrencia": 4,
+    "limite_fila": 10
+  }
+}
+```
+
+Arquivo acima do limite (HTTP 413):
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ Arquivo excede o limite de 100MB."
 }
 ```
 
@@ -271,7 +332,7 @@ Resposta:
     "downloads_a_frente": 2,
     "posicao_na_fila": 1,
     "enfileirados": 3,
-    "limite_concorrencia": 2,
+    "limite_concorrencia": 4,
     "limite_fila": 10
   }
 }
@@ -285,17 +346,19 @@ Resposta:
 GET /stream/:arquivo
 ```
 
-Exemplo:
+* Busca o arquivo diretamente em `downloads/`
+* Suporta `Range` para streaming progressivo
+
+---
+
+### 🔹 Streaming por request_id
 
 ```http
-GET /stream/Meu%20Video.mp4
-Range: bytes=0-
+GET /stream/:requestId/:arquivo
 ```
 
-Notas:
-
+* Busca em `downloads/<request_id>/`
 * Suporta `Range` para streaming progressivo
-* O arquivo deve existir na pasta `downloads/`
 
 ---
 
@@ -304,15 +367,14 @@ Notas:
 * 🚫 Não copie cookies manualmente do navegador
 * ✅ Use sempre cookies no formato Netscape
 * ⚠️ Não exponha sua API publicamente sem autenticação
-* 💡 Ideal para uso interno ou controlado
-* ⚙️ Configure o limite de conversão com `MAX_CONCURRENT_FFMPEG`
+* 🧹 O endpoint `/download` remove o arquivo após o envio (cleanup automático)
+* 🎛️ A conversão gera MP3 (áudio) ou MP4 H.264/AAC (vídeo, largura máx. 1280)
 
 ---
 
 ## 🛣️ Roadmap (futuras melhorias)
 
-* 🔄 Status de download
-* 📊 Progresso em tempo real (WebSocket)
+* 📊 Progresso em tempo real (SSE/WebSocket)
 * 🔐 Autenticação por token
 * 🐳 Docker
 
@@ -321,7 +383,7 @@ Notas:
 ## 👤 Autor
 
 **Kaiky Brito**
-🔗 GitHub: [https://github.com/kaikybrofc](https://github.com/kaikybrofc)
+GitHub: https://github.com/kaikybrofc
 
 ---
 
