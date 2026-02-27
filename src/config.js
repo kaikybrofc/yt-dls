@@ -1,7 +1,7 @@
 const path = require("path");
 
 const HOST = "127.0.0.1";
-const PORT = 3000;
+const PORT = 3013;
 
 const ROOT_DIR = path.resolve(__dirname, "..");
 const YTDLP_BINARY_PATH = path.join(ROOT_DIR, "bin", "yt-dlp");

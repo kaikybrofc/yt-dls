@@ -189,6 +189,8 @@ app.post("/download", async (req, res) => {
               COOKIES_PATH,
               "--js-runtimes",
               "node",
+              "--extractor-args",
+              "youtube:player_client=android,web",
               "--no-warnings",
             ]);
             videoInfo = JSON.parse(infoRaw);
@@ -210,6 +212,8 @@ app.post("/download", async (req, res) => {
             COOKIES_PATH,
             "--js-runtimes",
             "node",
+            "--extractor-args",
+            "youtube:player_client=android,web",
 
             // Template de saída (NÃO adivinhamos nome)
             "-o",
