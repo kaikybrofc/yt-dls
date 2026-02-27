@@ -271,6 +271,22 @@ Cookies ausentes:
 }
 ```
 
+Bloqueio anti-bot do YouTube (HTTP 403):
+
+```json
+{
+  "sucesso": false,
+  "mensagem": "❌ O YouTube solicitou verificação anti-bot para este vídeo.",
+  "erro": "Renove o cookies.txt com conta logada e exporte novamente em formato Netscape.",
+  "diagnostico": {
+    "request_id": "meu_id_123",
+    "cookie_path": "/caminho/do/projeto/cookies.txt",
+    "cookies_auth_detectados": ["__Secure-3PSID"],
+    "dica": "Use a extensão 'Get cookies.txt (LOCALLY)' no navegador já logado no YouTube e substitua o arquivo."
+  }
+}
+```
+
 Fila cheia (HTTP 429):
 
 ```json
@@ -366,6 +382,8 @@ GET /stream/:requestId/:arquivo
 
 * 🚫 Não copie cookies manualmente do navegador
 * ✅ Use sempre cookies no formato Netscape
+* 🔄 Se aparecer erro de anti-bot (HTTP 403), reexporte os cookies com sessão logada no YouTube
+* 🎯 Alguns vídeos específicos exigem autenticação mais forte; outros podem baixar normalmente no mesmo servidor
 * ⚠️ Não exponha sua API publicamente sem autenticação
 * 🧹 O endpoint `/download` remove o arquivo após o envio (cleanup automático)
 * 🎛️ A conversão gera MP3 (áudio) ou MP4 H.264/AAC (vídeo, largura máx. 1280)

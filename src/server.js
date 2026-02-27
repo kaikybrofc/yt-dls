@@ -43,6 +43,84 @@ const { convertMedia } = createMediaConverter({
   convertTimeoutMs: CONVERT_TIMEOUT_MS,
 });
 
+const YOUTUBE_AUTH_COOKIE_NAMES = new Set([
+  "SID",
+  "HSID",
+  "SSID",
+  "APISID",
+  "SAPISID",
+  "LOGIN_INFO",
+  "__Secure-1PSID",
+  "__Secure-3PSID",
+  "__Secure-3PAPISID",
+]);
+
+function isYoutubeBotCheckError(text) {
+  if (!text) return false;
+  return /sign in to confirm you(?:'|’)re not a bot/i.test(String(text));
+}
+
+function analyzeCookiesFile(filePath) {
+  const report = {
+    totalCookies: 0,
+    hasYoutubeDomain: false,
+    hasAuthCookie: false,
+    authCookieNames: [],
+  };
+
+  let content = "";
+  try {
+    content = fs.readFileSync(filePath, "utf8");
+  } catch (erro) {
+    return { ...report, readError: erro.message };
+  }
+
+  const authFound = new Set();
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === "# Netscape HTTP Cookie File") continue;
+
+    const columns = line.split("\t");
+    if (columns.length < 7) continue;
+
+    let domain = columns[0].trim();
+    if (!domain) continue;
+
+    if (domain.startsWith("#HttpOnly_")) {
+      domain = domain.slice("#HttpOnly_".length);
+    } else if (domain.startsWith("#")) {
+      continue;
+    }
+
+    const cookieName = columns[5]?.trim();
+    if (!cookieName) continue;
+
+    report.totalCookies += 1;
+    if (/youtube\.com$/i.test(domain.replace(/^\./, ""))) {
+      report.hasYoutubeDomain = true;
+    }
+    if (YOUTUBE_AUTH_COOKIE_NAMES.has(cookieName)) {
+      report.hasAuthCookie = true;
+      authFound.add(cookieName);
+    }
+  }
+
+  report.authCookieNames = Array.from(authFound).sort();
+  return report;
+}
+
+function buildCommonYtDlpArgs() {
+  return [
+    "--cookies",
+    COOKIES_PATH,
+    "--js-runtimes",
+    "node",
+    "--extractor-args",
+    "youtube:player_client=android,web",
+    "--no-warnings",
+  ];
+}
+
 // ==================== ROTAS ====================
 
 // Health check
@@ -160,6 +238,42 @@ app.post("/download", async (req, res) => {
           });
         }
 
+        const cookiesDiagnostics = analyzeCookiesFile(COOKIES_PATH);
+        if (cookiesDiagnostics.readError) {
+          console.error(
+            `❌ Falha ao ler cookies.txt | request_id=${requestId} | erro=${cookiesDiagnostics.readError}`,
+          );
+          return res.status(500).json({
+            sucesso: false,
+            mensagem: "❌ Não foi possível ler o arquivo cookies.txt.",
+            erro: cookiesDiagnostics.readError,
+          });
+        }
+
+        if (
+          cookiesDiagnostics.totalCookies === 0 ||
+          !cookiesDiagnostics.hasYoutubeDomain
+        ) {
+          console.error(
+            `❌ cookies.txt invalido | request_id=${requestId} | total=${cookiesDiagnostics.totalCookies} | youtube_domain=${cookiesDiagnostics.hasYoutubeDomain}`,
+          );
+          return res.status(500).json({
+            sucesso: false,
+            mensagem:
+              "❌ cookies.txt inválido. Exporte novamente no formato Netscape com sessão ativa no YouTube.",
+            diagnostico: {
+              total_cookies: cookiesDiagnostics.totalCookies,
+              tem_dominio_youtube: cookiesDiagnostics.hasYoutubeDomain,
+            },
+          });
+        }
+
+        if (!cookiesDiagnostics.hasAuthCookie) {
+          console.warn(
+            `⚠️ cookies sem autenticacao forte | request_id=${requestId} | auth_detectados=0`,
+          );
+        }
+
         const tipoSaida = type === "audio" ? "audio" : "video";
         console.log(
           `⬇️ Iniciando download | request_id=${requestId} | tipo=${tipoSaida} | link=${link}`,
@@ -168,6 +282,7 @@ app.post("/download", async (req, res) => {
         let arquivoFinal = null;
         let videoInfo = null;
         let processoErro = null;
+        let metadataBlockedByBotCheck = false;
         const startedAt = Date.now();
 
         try {
@@ -185,22 +300,18 @@ app.post("/download", async (req, res) => {
               "--dump-single-json",
               "--skip-download",
               "--no-playlist",
-              "--cookies",
-              COOKIES_PATH,
-              "--js-runtimes",
-              "node",
-              "--extractor-args",
-              "youtube:player_client=android,web",
-              "--no-warnings",
+              ...buildCommonYtDlpArgs(),
             ]);
             videoInfo = JSON.parse(infoRaw);
             console.log(
               `✅ Metadados obtidos | request_id=${requestId} | titulo=${videoInfo?.title || "desconhecido"}`,
             );
           } catch (infoErro) {
+            const infoErroTexto =
+              infoErro?.stderr || infoErro?.message || String(infoErro);
+            metadataBlockedByBotCheck = isYoutubeBotCheckError(infoErroTexto);
             console.warn(
-              "⚠️ Não foi possível obter metadados do vídeo:",
-              infoErro.message,
+              `⚠️ Não foi possível obter metadados do vídeo | request_id=${requestId} | bloqueio_anti_bot=${metadataBlockedByBotCheck} | erro=${infoErroTexto}`,
             );
           }
 
@@ -208,12 +319,7 @@ app.post("/download", async (req, res) => {
             link,
 
             // Cookies e runtime JS
-            "--cookies",
-            COOKIES_PATH,
-            "--js-runtimes",
-            "node",
-            "--extractor-args",
-            "youtube:player_client=android,web",
+            ...buildCommonYtDlpArgs(),
 
             // Template de saída (NÃO adivinhamos nome)
             "-o",
@@ -257,7 +363,7 @@ app.post("/download", async (req, res) => {
           });
 
           processo.on("error", (erro) => {
-            processoErro = erro.stderr || erro.message || null;
+            processoErro = erro?.stderr || erro?.message || String(erro);
             console.error(
               `❌ Erro yt-dlp | request_id=${requestId} | ${processoErro}`,
             );
@@ -300,6 +406,28 @@ app.post("/download", async (req, res) => {
           await new Promise((resolve) => processo.on("close", resolve));
 
           if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
+            const bloqueioAntiBot =
+              isYoutubeBotCheckError(processoErro) || metadataBlockedByBotCheck;
+            if (bloqueioAntiBot) {
+              console.warn(
+                `⚠️ Bloqueio anti-bot do YouTube | request_id=${requestId}`,
+              );
+              return res.status(403).json({
+                sucesso: false,
+                mensagem:
+                  "❌ O YouTube solicitou verificação anti-bot para este vídeo.",
+                erro:
+                  "Renove o cookies.txt com conta logada e exporte novamente em formato Netscape.",
+                diagnostico: {
+                  request_id: requestId,
+                  cookie_path: COOKIES_PATH,
+                  cookies_auth_detectados: cookiesDiagnostics.authCookieNames,
+                  dica:
+                    "Use a extensão 'Get cookies.txt (LOCALLY)' no navegador já logado no YouTube e substitua o arquivo.",
+                },
+              });
+            }
+
             const excedeuLimite =
               processoErro &&
               /max-filesize|file is larger than/i.test(processoErro);
