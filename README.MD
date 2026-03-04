@@ -231,6 +231,24 @@ Headers relevantes:
 - `X-Queue-Limit`: limite de concorrência
 - `X-Request-Id`: `request_id` usado
 
+Exemplo real (`POST /download`, `type=audio`, capturado em 2026-03-04):
+
+```http
+HTTP/1.1 200 OK
+Content-Length: 4117035
+Content-Type: audio/mpeg
+Content-Disposition: attachment; filename="audio_1772665394738_120d879a558da.mp3"
+X-Queue-Ahead: 0
+X-Queue-Limit: 4
+X-Request-Id: readme-ok-1772665376
+```
+
+Corpo da resposta:
+
+```text
+[binario mp3]
+```
+
 ---
 
 ### ❌ Erros comuns
@@ -242,6 +260,15 @@ Campos obrigatórios:
   "sucesso": false,
   "mensagem": "❌ O campo 'link' é obrigatório."
 }
+```
+
+Exemplo real (`POST /download` sem `link`, capturado em 2026-03-04):
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json; charset=utf-8
+
+{"sucesso":false,"mensagem":"❌ O campo 'link' é obrigatório."}
 ```
 
 `request_id` inválido:

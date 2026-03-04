@@ -60,6 +60,22 @@ function isYoutubeBotCheckError(text) {
   return /sign in to confirm you(?:'|’)re not a bot/i.test(String(text));
 }
 
+function extractYtDlpErrorText(err) {
+  if (!err) return "";
+  if (typeof err === "string") return err;
+  return (
+    err.stderr ||
+    err.stdout ||
+    err.message ||
+    (typeof err.toString === "function" ? err.toString() : String(err))
+  );
+}
+
+function isRequestedFormatUnavailableError(text) {
+  if (!text) return false;
+  return /requested format is not available/i.test(String(text));
+}
+
 function analyzeCookiesFile(filePath) {
   const report = {
     totalCookies: 0,
@@ -109,16 +125,21 @@ function analyzeCookiesFile(filePath) {
   return report;
 }
 
-function buildCommonYtDlpArgs() {
-  return [
-    "--cookies",
-    COOKIES_PATH,
+function buildCommonYtDlpArgs({ includeCookies = true } = {}) {
+  const args = [];
+  if (includeCookies) {
+    args.push("--cookies", COOKIES_PATH);
+  }
+
+  args.push(
     "--js-runtimes",
     "node",
     "--extractor-args",
     "youtube:player_client=android,web",
     "--no-warnings",
-  ];
+  );
+
+  return args;
 }
 
 // ==================== ROTAS ====================
@@ -283,7 +304,6 @@ app.post("/download", async (req, res) => {
         let videoInfo = null;
         let processoErro = null;
         let metadataBlockedByBotCheck = false;
-        const startedAt = Date.now();
 
         try {
           const requestDir = path.join(DOWNLOADS_DIR, requestId);
@@ -300,6 +320,7 @@ app.post("/download", async (req, res) => {
               "--dump-single-json",
               "--skip-download",
               "--no-playlist",
+              "--ignore-no-formats-error",
               ...buildCommonYtDlpArgs(),
             ]);
             videoInfo = JSON.parse(infoRaw);
@@ -307,23 +328,18 @@ app.post("/download", async (req, res) => {
               `✅ Metadados obtidos | request_id=${requestId} | titulo=${videoInfo?.title || "desconhecido"}`,
             );
           } catch (infoErro) {
-            const infoErroTexto =
-              infoErro?.stderr || infoErro?.message || String(infoErro);
+            const infoErroTexto = extractYtDlpErrorText(infoErro);
             metadataBlockedByBotCheck = isYoutubeBotCheckError(infoErroTexto);
             console.warn(
               `⚠️ Não foi possível obter metadados do vídeo | request_id=${requestId} | bloqueio_anti_bot=${metadataBlockedByBotCheck} | erro=${infoErroTexto}`,
             );
           }
 
-          const args = [
-            link,
-
-            // Cookies e runtime JS
-            ...buildCommonYtDlpArgs(),
-
+          const outputTemplate = path.join(requestDir, "%(title)s.%(ext)s");
+          const downloadArgsBase = [
             // Template de saída (NÃO adivinhamos nome)
             "-o",
-            path.join(requestDir, "%(title)s.%(ext)s"),
+            outputTemplate,
 
             // Retorna o caminho real do arquivo final
             "--print",
@@ -331,81 +347,192 @@ app.post("/download", async (req, res) => {
             "--print",
             "after_move:%(filepath)s",
 
-            "--no-warnings",
             "--max-filesize",
             MAX_DOWNLOAD_LABEL,
           ];
 
           if (tipoSaida === "audio") {
-            args.push("-x", "--audio-format", "mp3");
+            downloadArgsBase.push("-x", "--audio-format", "mp3");
           } else {
-            args.push("-f", VIDEO_FORMAT, "--merge-output-format", "mp4");
+            downloadArgsBase.push("-f", VIDEO_FORMAT, "--merge-output-format", "mp4");
           }
 
-          console.log(
-            `🚀 Executando yt-dlp | request_id=${requestId} | tipo=${tipoSaida}`,
-          );
-          const processo = ytDlpWrap.exec(args);
+          const executeDownloadAttempt = async ({
+            includeCookies,
+            attemptLabel,
+          }) => {
+            let localArquivoFinal = null;
+            let localProcessoErro = null;
+            const attemptStartedAt = Date.now();
+            const args = [
+              link,
+              ...buildCommonYtDlpArgs({ includeCookies }),
+              ...downloadArgsBase,
+            ];
 
-          processo.on("progress", (p) => {
             console.log(
-              `📥 Progresso | request_id=${requestId} | ${p.percent || 0}%`,
+              `🚀 Executando yt-dlp | request_id=${requestId} | tipo=${tipoSaida} | tentativa=${attemptLabel} | cookies=${includeCookies}`,
             );
-          });
 
-          processo.on("ytDlpEvent", (tipo, data) => {
-            if (tipo === "after_postprocess" || tipo === "after_move") {
-              arquivoFinal = data.trim();
+            const processo = ytDlpWrap.exec(args);
+
+            processo.on("progress", (p) => {
               console.log(
-                `📁 Arquivo final | request_id=${requestId} | path=${arquivoFinal}`,
+                `📥 Progresso | request_id=${requestId} | tentativa=${attemptLabel} | ${p.percent || 0}%`,
               );
-            }
-          });
+            });
 
-          processo.on("error", (erro) => {
-            processoErro = erro?.stderr || erro?.message || String(erro);
-            console.error(
-              `❌ Erro yt-dlp | request_id=${requestId} | ${processoErro}`,
-            );
-          });
-
-          processo.on("close", () => {
-            if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
-              const arquivos = fs
-                .readdirSync(requestDir)
-                .map((nome) => {
-                  const fullPath = path.join(requestDir, nome);
-                  const stat = fs.statSync(fullPath);
-                  return { fullPath, mtimeMs: stat.mtimeMs };
-                })
-                .sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-              const recentes = arquivos.filter(
-                (item) => item.mtimeMs >= startedAt - 60000,
-              );
-
-              if (recentes.length > 0) {
-                arquivoFinal = recentes[0].fullPath;
+            processo.on("ytDlpEvent", (eventType, data) => {
+              if (eventType === "after_postprocess" || eventType === "after_move") {
+                localArquivoFinal = data.trim();
                 console.log(
-                  `📁 Arquivo final (fallback) | request_id=${requestId} | path=${arquivoFinal}`,
-                );
-              } else if (arquivos.length > 0) {
-                arquivoFinal = arquivos[0].fullPath;
-                console.log(
-                  `📁 Arquivo final (fallback) | request_id=${requestId} | path=${arquivoFinal}`,
-                );
-              } else {
-                console.error(
-                  `❌ Download finalizou mas arquivo não encontrado | request_id=${requestId}`,
+                  `📁 Arquivo final | request_id=${requestId} | tentativa=${attemptLabel} | path=${localArquivoFinal}`,
                 );
               }
-            }
-          });
+            });
 
-          // Aguarda finalizar
-          await new Promise((resolve) => processo.on("close", resolve));
+            processo.on("error", (erro) => {
+              localProcessoErro = extractYtDlpErrorText(erro);
+              console.error(
+                `❌ Erro yt-dlp | request_id=${requestId} | tentativa=${attemptLabel} | ${localProcessoErro}`,
+              );
+            });
+
+            const resolveOutputByDirectoryFallback = () => {
+              if (!localArquivoFinal || !fs.existsSync(localArquivoFinal)) {
+                const arquivos = fs
+                  .readdirSync(requestDir)
+                  .map((nome) => {
+                    const fullPath = path.join(requestDir, nome);
+                    const stat = fs.statSync(fullPath);
+                    return { fullPath, mtimeMs: stat.mtimeMs };
+                  })
+                  .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+                const recentes = arquivos.filter(
+                  (item) => item.mtimeMs >= attemptStartedAt - 5000,
+                );
+
+                if (recentes.length > 0) {
+                  localArquivoFinal = recentes[0].fullPath;
+                  console.log(
+                    `📁 Arquivo final (fallback) | request_id=${requestId} | tentativa=${attemptLabel} | path=${localArquivoFinal}`,
+                  );
+                } else if (arquivos.length > 0) {
+                  localArquivoFinal = arquivos[0].fullPath;
+                  console.log(
+                    `📁 Arquivo final (fallback) | request_id=${requestId} | tentativa=${attemptLabel} | path=${localArquivoFinal}`,
+                  );
+                } else {
+                  console.error(
+                    `❌ Download finalizou mas arquivo não encontrado | request_id=${requestId} | tentativa=${attemptLabel}`,
+                  );
+                }
+              }
+            };
+
+            // Em alguns erros o yt-dlp-wrap pode emitir "error" sem emitir "close".
+            await new Promise((resolve) => {
+              let settled = false;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                resolveOutputByDirectoryFallback();
+                resolve();
+              };
+
+              processo.once("close", finish);
+              processo.once("error", () => {
+                setTimeout(finish, 250);
+              });
+            });
+
+            return {
+              arquivoFinal: localArquivoFinal,
+              processoErro: localProcessoErro,
+            };
+          };
+
+          let requestedFormatUnavailableWithCookies = false;
+          let requestedFormatUnavailableWithoutCookies = false;
+          let retryWithoutCookiesBlockedByBot = false;
+
+          const firstAttempt = await executeDownloadAttempt({
+            includeCookies: true,
+            attemptLabel: "com_cookies",
+          });
+          arquivoFinal = firstAttempt.arquivoFinal;
+          processoErro = firstAttempt.processoErro;
+          requestedFormatUnavailableWithCookies =
+            isRequestedFormatUnavailableError(processoErro);
+
+          if (
+            (!arquivoFinal || !fs.existsSync(arquivoFinal)) &&
+            requestedFormatUnavailableWithCookies
+          ) {
+            console.warn(
+              `⚠️ Nenhum formato disponivel com cookies | request_id=${requestId} | tentando sem cookies`,
+            );
+            const secondAttempt = await executeDownloadAttempt({
+              includeCookies: false,
+              attemptLabel: "sem_cookies",
+            });
+
+            if (secondAttempt.arquivoFinal && fs.existsSync(secondAttempt.arquivoFinal)) {
+              arquivoFinal = secondAttempt.arquivoFinal;
+              processoErro = secondAttempt.processoErro;
+            } else {
+              processoErro = secondAttempt.processoErro || processoErro;
+              requestedFormatUnavailableWithoutCookies =
+                isRequestedFormatUnavailableError(secondAttempt.processoErro);
+              retryWithoutCookiesBlockedByBot = isYoutubeBotCheckError(
+                secondAttempt.processoErro,
+              );
+            }
+          }
 
           if (!arquivoFinal || !fs.existsSync(arquivoFinal)) {
+            const semFormatoDisponivel =
+              isRequestedFormatUnavailableError(processoErro) ||
+              requestedFormatUnavailableWithCookies ||
+              requestedFormatUnavailableWithoutCookies;
+            if (
+              semFormatoDisponivel &&
+              requestedFormatUnavailableWithCookies &&
+              retryWithoutCookiesBlockedByBot
+            ) {
+              console.warn(
+                `⚠️ Sem formatos com cookies e sem cookies bloqueado por anti-bot | request_id=${requestId}`,
+              );
+              return res.status(403).json({
+                sucesso: false,
+                mensagem:
+                  "❌ Não foi possível obter formatos de mídia deste vídeo no momento.",
+                erro:
+                  "Com os cookies atuais o YouTube não retorna formatos de áudio/vídeo, e sem cookies ele exige verificação anti-bot.",
+                diagnostico: {
+                  request_id: requestId,
+                  cookie_path: COOKIES_PATH,
+                  cookies_auth_detectados: cookiesDiagnostics.authCookieNames,
+                  dica:
+                    "Exporte novamente o cookies.txt de uma sessão ativa e teste de novo.",
+                },
+              });
+            }
+
+            if (semFormatoDisponivel) {
+              console.warn(
+                `⚠️ Nenhum formato de midia disponivel | request_id=${requestId}`,
+              );
+              return res.status(422).json({
+                sucesso: false,
+                mensagem:
+                  "❌ O YouTube não disponibilizou formatos de mídia compatíveis para este vídeo.",
+                erro:
+                  "Requested format is not available. Atualize o cookies.txt e tente novamente.",
+              });
+            }
+
             const bloqueioAntiBot =
               isYoutubeBotCheckError(processoErro) || metadataBlockedByBotCheck;
             if (bloqueioAntiBot) {
