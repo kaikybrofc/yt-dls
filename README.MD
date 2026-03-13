@@ -15,12 +15,17 @@ Projeto focado em:
 
 * ✅ Download de vídeos do YouTube
 * 🔍 Busca simples por título (`GET /search`)
+* ⚡ Resolve rápido sem download (`POST /resolve`)
+* 🎧 Stream imediato por `track_id` com suporte a `Range` (`GET /stream/:track_id`)
+* 🔥 Prefetch de fila com warmup de chunk (`POST /prefetch`)
 * 🔐 Suporte a cookies (anti-bot)
 * 🧠 Runtime JavaScript exigido pelo YouTube
-* 🧵 Fila e limite de concorrência (download e FFmpeg)
+* 🧵 Fila e limite de concorrência (download, resolve e prefetch)
 * 🎛️ Conversão via FFmpeg (MP3/MP4)
+* 🌀 Transcode opcional para Opus em tempo real (`?transcode=opus`)
 * 📁 Organização automática por `request_id`
 * 📦 Stream direto como resposta do download
+* 📊 Métricas internas (`GET /metrics`)
 
 ---
 
@@ -53,6 +58,12 @@ yt-dls/
 │     ├─ media.js    # Conversão/FFmpeg
 │     ├─ semaphore.js # Fila/concorrência
 │     ├─ stream.js   # Stream de arquivo
+│     ├─ remote-stream.js # Proxy stream remoto + warmup
+│     ├─ worker-pool.js # Pool de workers persistentes
+│     ├─ ttl-cache.js # Cache em memória com TTL
+│     ├─ cookie-manager.js # Rotação/refresh de cookies
+│     ├─ keyed-limiter.js # Limites por IP/guild
+│     ├─ metrics.js # Coleta de métricas
 │     └─ validators.js # Validadores
 ├─ scripts/
 │  └─ install.js     # Instalação do yt-dlp
@@ -117,12 +128,17 @@ As configurações ficam em `src/config.js` (por enquanto não há `.env`).
 Valores padrão importantes:
 
 * `HOST`: `127.0.0.1`
-* `PORT`: `3000`
+* `PORT`: `3013`
 * `MAX_DOWNLOAD_BYTES`: `100MB`
 * `MAX_CONCURRENT_DOWNLOADS`: `4`
 * `MAX_QUEUE_SIZE`: `10`
 * `MAX_CONCURRENT_FFMPEG`: via env (default `1`)
 * `CONVERT_TIMEOUT_MS`: `300000` (5 min)
+* `RESOLVE_CACHE_TTL_MS`: cache curto do resolve (default `120000`)
+* `RESOLVE_POOL_SIZE` / `PREFETCH_POOL_SIZE`: workers quentes para baixa latência
+* `MAX_ACTIVE_STREAMS_PER_IP` / `MAX_ACTIVE_STREAMS_PER_GUILD`: limite anti-bloqueio
+* `YTDLP_MAX_RETRIES` + backoff automático em erro anti-bot
+* `ENABLE_OPUS_TRANSCODE=true`: habilita transcode Opus em tempo real
 
 ---
 
@@ -135,7 +151,7 @@ npm start
 Servidor rodando em:
 
 ```
-http://127.0.0.1:3000
+http://127.0.0.1:3013
 ```
 
 ### PM2 (opcional)
@@ -197,6 +213,87 @@ Erros:
   "mensagem": "❌ O parâmetro 'q' é obrigatório."
 }
 ```
+
+---
+
+### 🔹 Resolve rápido (sem download)
+
+```http
+POST /resolve
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "link": "https://youtu.be/VIDEO_ID",
+  "type": "audio",
+  "guild_id": "guild_123"
+}
+```
+
+Resposta:
+
+```json
+{
+  "sucesso": true,
+  "track_id": "uuid",
+  "title": "Titulo",
+  "duration": 213,
+  "thumbnail": "https://...",
+  "stream_url": "http://127.0.0.1:3013/stream/uuid?exp=...&sig=...",
+  "expires_at": 1773441310580,
+  "cache_hit": false
+}
+```
+
+---
+
+### 🔹 Prefetch da fila
+
+```http
+POST /prefetch
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "track_ids": ["uuid1", "uuid2"]
+}
+```
+
+Resposta:
+
+```json
+{
+  "sucesso": true,
+  "accepted": [{ "track_id": "uuid1", "status": "pending" }],
+  "failed": []
+}
+```
+
+Status individual:
+
+```http
+GET /prefetch/status/:trackId
+```
+
+Retorna `pending`, `ready` ou `failed`.
+
+---
+
+### 🔹 Stream imediato por track_id
+
+```http
+GET /stream/:track_id?exp=...&sig=...
+```
+
+* Suporta `Range` (206 Partial Content)
+* Usa chunked transfer quando apropriado
+* Se `ENABLE_OPUS_TRANSCODE=true` ou `?transcode=opus`, faz Opus em tempo real (sem `Range`)
 
 ---
 
