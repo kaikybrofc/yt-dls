@@ -97,6 +97,13 @@ const prefetchStatusCache = new TTLCache({
   defaultTtlMs: Math.max(RESOLVE_CACHE_TTL_MS, 120000),
   maxEntries: TRACK_CACHE_MAX,
 });
+const inFlightResolveByLookup = new Map();
+const seenTrackIdsCache = new TTLCache({
+  defaultTtlMs: Math.max(600000, RESOLVE_CACHE_TTL_MS * 10),
+  maxEntries: Math.max(TRACK_CACHE_MAX * 4, 2000),
+});
+const activeStreamsByTrackId = new Map();
+const STREAM_TRACK_RETENTION_GRACE_MS = 120000;
 
 const resolveWorkerPool = new WorkerPool({
   name: "resolve-pool",
@@ -394,14 +401,39 @@ function buildSignedStreamUrl(req, trackId, expiresAt) {
   return `${baseUrl}/stream/${encodeURIComponent(trackId)}?exp=${expiresAt}&sig=${signature}`;
 }
 
+function parseSignedExpMs(expRaw) {
+  const rawNumber = Number(expRaw);
+  if (!Number.isFinite(rawNumber) || rawNumber <= 0) {
+    return null;
+  }
+
+  if (rawNumber > 1e12) {
+    return Math.floor(rawNumber);
+  }
+
+  return Math.floor(rawNumber * 1000);
+}
+
 function validateSignedStream({ trackId, expRaw, sigRaw }) {
-  const expiresAt = Number(expRaw);
-  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+  const rawExp = Number(expRaw);
+  const expiresAt = parseSignedExpMs(expRaw);
+  if (!expiresAt) {
+    return { valid: false, reason: "exp_invalid" };
+  }
+
+  if (expiresAt <= Date.now()) {
     return { valid: false, reason: "expired" };
   }
 
-  const expected = createSignature(trackId, expiresAt);
-  if (!compareSignature(sigRaw, expected)) {
+  const expectedSignatures = [createSignature(trackId, expiresAt)];
+  if (Number.isFinite(rawExp) && rawExp > 0 && rawExp <= 1e12) {
+    expectedSignatures.push(createSignature(trackId, Math.floor(rawExp)));
+  }
+
+  const signatureValid = expectedSignatures.some((expected) =>
+    compareSignature(sigRaw, expected),
+  );
+  if (!signatureValid) {
     return { valid: false, reason: "signature_invalid" };
   }
 
@@ -418,6 +450,7 @@ function upsertTrackCache(lookupKey, payload, ttlMs) {
   };
   resolveCacheByLookup.set(lookupKey, merged.track_id, ttl);
   resolveCacheByTrackId.set(merged.track_id, merged, ttl);
+  seenTrackIdsCache.set(merged.track_id, { seenAt: Date.now() });
   return merged;
 }
 
@@ -429,6 +462,152 @@ function getTrackByLookupKey(lookupKey) {
 
 function getTrackById(trackId) {
   return resolveCacheByTrackId.get(trackId);
+}
+
+function normalizePrefetchTrackIds(body) {
+  const ids = [];
+
+  const addValue = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        addValue(item);
+      }
+      return;
+    }
+
+    const normalized = String(value || "").trim();
+    if (normalized) {
+      ids.push(normalized);
+    }
+  };
+
+  addValue(body?.track_ids);
+  addValue(body?.track_id);
+  addValue(body?.trackId);
+
+  return Array.from(new Set(ids));
+}
+
+function incrementStream404Reason(reason) {
+  const normalized = String(reason || "unknown_track");
+  metrics.increment("stream_404_reason", 1);
+  metrics.increment(`stream_404_reason_${normalized}`, 1);
+}
+
+function retainTrackCacheForStreaming(track) {
+  if (!track || !track.track_id || !track.link) {
+    return track;
+  }
+
+  const lookupKey = createResolveLookupKey(track.link, track.type);
+  const expiresAt = Number(track.expires_at) || Date.now();
+  const ttlToProtectActiveStream = Math.max(
+    1000,
+    expiresAt + STREAM_TRACK_RETENTION_GRACE_MS - Date.now(),
+    STREAM_TRACK_RETENTION_GRACE_MS,
+  );
+  return upsertTrackCache(lookupKey, track, ttlToProtectActiveStream);
+}
+
+function getActiveTrackById(trackId) {
+  const active = activeStreamsByTrackId.get(String(trackId || ""));
+  return active?.track || null;
+}
+
+function acquireActiveTrackLease(track) {
+  if (!track || !track.track_id) {
+    return {
+      track,
+      release: () => {},
+    };
+  }
+
+  const retainedTrack = retainTrackCacheForStreaming(track);
+  const key = String(retainedTrack.track_id);
+  const current = activeStreamsByTrackId.get(key) || {
+    count: 0,
+    track: retainedTrack,
+  };
+
+  current.count += 1;
+  current.track = retainedTrack;
+  activeStreamsByTrackId.set(key, current);
+
+  let released = false;
+  return {
+    track: retainedTrack,
+    release: () => {
+      if (released) return;
+      released = true;
+      const state = activeStreamsByTrackId.get(key);
+      if (!state) return;
+
+      if (state.count <= 1) {
+        activeStreamsByTrackId.delete(key);
+        return;
+      }
+
+      state.count -= 1;
+      activeStreamsByTrackId.set(key, state);
+    },
+  };
+}
+
+function updateActiveTrackLease(track) {
+  if (!track || !track.track_id) {
+    return track;
+  }
+
+  const key = String(track.track_id);
+  const state = activeStreamsByTrackId.get(key);
+  const retainedTrack = retainTrackCacheForStreaming(track);
+  if (state) {
+    state.track = retainedTrack;
+    activeStreamsByTrackId.set(key, state);
+  }
+  return retainedTrack;
+}
+
+const activeStreamRetentionTimer = setInterval(() => {
+  for (const [trackId, state] of activeStreamsByTrackId.entries()) {
+    if (!state || state.count <= 0 || !state.track) {
+      activeStreamsByTrackId.delete(trackId);
+      continue;
+    }
+
+    state.track = retainTrackCacheForStreaming(state.track);
+    activeStreamsByTrackId.set(trackId, state);
+  }
+}, 30000);
+
+if (typeof activeStreamRetentionTimer.unref === "function") {
+  activeStreamRetentionTimer.unref();
+}
+
+async function runResolveSingleflight(lookupKey, resolver) {
+  const key = String(lookupKey || "");
+  const pending = inFlightResolveByLookup.get(key);
+  if (pending) {
+    const waitStartedAt = Date.now();
+    metrics.increment("resolve_singleflight_joined", 1);
+    try {
+      return await pending;
+    } finally {
+      metrics.observe("resolve_singleflight_wait_ms", Date.now() - waitStartedAt);
+    }
+  }
+
+  metrics.increment("resolve_singleflight_started", 1);
+  const taskPromise = Promise.resolve().then(() => resolver());
+  inFlightResolveByLookup.set(key, taskPromise);
+
+  try {
+    return await taskPromise;
+  } finally {
+    if (inFlightResolveByLookup.get(key) === taskPromise) {
+      inFlightResolveByLookup.delete(key);
+    }
+  }
 }
 
 async function runYtDlpInfoWithRetry({ link, tipo }) {
@@ -518,8 +697,9 @@ function needsResolveRefresh(track) {
   return !track.stream_source_url || track.expires_at <= now + 15000;
 }
 
-async function refreshTrackIfNeeded(track) {
-  if (!needsResolveRefresh(track)) {
+async function refreshTrackIfNeeded(track, options = {}) {
+  const forceRefresh = Boolean(options.force);
+  if (!forceRefresh && !needsResolveRefresh(track)) {
     return track;
   }
 
@@ -599,6 +779,21 @@ function shouldUseWarmChunk(track, req) {
   }
   if (!track.warmedAt) return false;
   return Date.now() - track.warmedAt <= WARM_CHUNK_TTL_MS;
+}
+
+const RETRYABLE_UPSTREAM_STREAM_STATUS = new Set([401, 403, 410]);
+
+function shouldRetryExpiredStream(error) {
+  const statusFromProp = Number(error?.upstreamStatusCode);
+  if (RETRYABLE_UPSTREAM_STREAM_STATUS.has(statusFromProp)) {
+    return true;
+  }
+
+  const statusMatch = String(error?.message || "").match(/status\s+(\d{3})/i);
+  if (!statusMatch) return false;
+
+  const statusFromMessage = Number(statusMatch[1]);
+  return RETRYABLE_UPSTREAM_STREAM_STATUS.has(statusFromMessage);
 }
 
 function streamAsOpus({ req, res, track, onFirstByte }) {
@@ -830,19 +1025,31 @@ app.post("/resolve", async (req, res) => {
   }
 
   try {
-    let cacheHit = false;
-    let entry = getTrackByLookupKey(lookupKey);
+    const { entry, cacheHit } = await runResolveSingleflight(
+      lookupKey,
+      async () => {
+        let resolvedCacheHit = false;
+        let resolvedEntry = getTrackByLookupKey(lookupKey);
 
-    if (entry && !needsResolveRefresh(entry)) {
-      cacheHit = true;
-      metrics.increment("resolve_cache_hit", 1);
-    } else if (entry) {
-      entry = await resolveWorkerPool.run(() => refreshTrackIfNeeded(entry));
-    } else {
-      entry = await resolveWorkerPool.run(() =>
-        resolveTrackEntry({ link, type: tipo, lookupKey }),
-      );
-    }
+        if (resolvedEntry && !needsResolveRefresh(resolvedEntry)) {
+          resolvedCacheHit = true;
+          metrics.increment("resolve_cache_hit", 1);
+        } else if (resolvedEntry) {
+          resolvedEntry = await resolveWorkerPool.run(() =>
+            refreshTrackIfNeeded(resolvedEntry),
+          );
+        } else {
+          resolvedEntry = await resolveWorkerPool.run(() =>
+            resolveTrackEntry({ link, type: tipo, lookupKey }),
+          );
+        }
+
+        return {
+          entry: resolvedEntry,
+          cacheHit: resolvedCacheHit,
+        };
+      },
+    );
 
     const streamUrl = buildSignedStreamUrl(req, entry.track_id, entry.expires_at);
     metrics.observe("resolve_ms", Date.now() - startedAt);
@@ -891,17 +1098,15 @@ app.post("/resolve", async (req, res) => {
  * Prefetch dos próximos tracks
  */
 app.post("/prefetch", async (req, res) => {
-  const trackIdsRaw = req.body?.track_ids;
-  const trackIds = Array.isArray(trackIdsRaw)
-    ? trackIdsRaw.map((item) => String(item || "").trim()).filter(Boolean)
-    : [];
+  const trackIds = normalizePrefetchTrackIds(req.body);
   const guildId = getGuildIdFromRequest(req) || "anonymous";
   const ip = getClientIp(req);
 
   if (!trackIds.length) {
     return res.status(400).json({
       sucesso: false,
-      mensagem: "❌ O campo 'track_ids' deve ser um array não vazio.",
+      mensagem:
+        "❌ Informe ao menos um track em 'track_ids', 'track_id' ou 'trackId'.",
     });
   }
 
@@ -930,7 +1135,7 @@ app.post("/prefetch", async (req, res) => {
     const failed = [];
 
     for (const trackId of uniqueTrackIds) {
-      const track = getTrackById(trackId);
+      const track = getTrackById(trackId) || getActiveTrackById(trackId);
       if (!track) {
         prefetchStatusCache.set(trackId, {
           status: "failed",
@@ -1009,7 +1214,7 @@ app.get("/prefetch/status/:trackId", (req, res) => {
 
   const status = prefetchStatusCache.get(trackId);
   if (!status) {
-    const track = getTrackById(trackId);
+    const track = getTrackById(trackId) || getActiveTrackById(trackId);
     if (!track) {
       return res.status(404).json({
         sucesso: false,
@@ -1045,6 +1250,10 @@ app.get("/metrics", (req, res) => {
       resolve_lookup: resolveCacheByLookup.size,
       resolve_track: resolveCacheByTrackId.size,
       prefetch_status: prefetchStatusCache.size,
+    },
+    in_flight: {
+      resolve_singleflight: inFlightResolveByLookup.size,
+      active_stream_tracks: activeStreamsByTrackId.size,
     },
     cookies: cookieManager.getStats(),
   });
@@ -1601,23 +1810,53 @@ app.get("/stream/:trackId", async (req, res) => {
     });
   }
 
-  const cachedTrack = getTrackById(trackId);
-  if (!cachedTrack) {
-    // Compatibilidade com rota antiga: /stream/:arquivo
-    const caminho = path.join(DOWNLOADS_DIR, trackId);
-    return streamLocalFileWithRange(req, res, caminho, "video/mp4");
+  const hasSignedParams =
+    req.query.exp !== undefined || req.query.sig !== undefined;
+  if (hasSignedParams) {
+    const signatureValidation = validateSignedStream({
+      trackId,
+      expRaw: req.query.exp,
+      sigRaw: req.query.sig,
+    });
+    if (!signatureValidation.valid) {
+      const statusCode = signatureValidation.reason === "expired" ? 410 : 401;
+      return res.status(statusCode).json({
+        sucesso: false,
+        mensagem: "❌ URL de stream inválida ou expirada.",
+        motivo: signatureValidation.reason,
+      });
+    }
   }
 
-  const signatureValidation = validateSignedStream({
-    trackId,
-    expRaw: req.query.exp,
-    sigRaw: req.query.sig,
-  });
-  if (!signatureValidation.valid) {
+  let cachedTrack = getTrackById(trackId);
+  if (!cachedTrack) {
+    cachedTrack = getActiveTrackById(trackId);
+  }
+
+  if (cachedTrack && !hasSignedParams) {
     return res.status(401).json({
       sucesso: false,
       mensagem: "❌ URL de stream inválida ou expirada.",
-      motivo: signatureValidation.reason,
+      motivo: "signature_missing",
+    });
+  }
+
+  if (!cachedTrack) {
+    // Compatibilidade com rota antiga: /stream/:arquivo
+    const caminho = path.join(DOWNLOADS_DIR, trackId);
+    if (fs.existsSync(caminho)) {
+      if (req.headers.range) {
+        metrics.increment("stream_range_resume_count", 1);
+      }
+      return streamLocalFileWithRange(req, res, caminho, "video/mp4");
+    }
+
+    const wasSeenBefore = seenTrackIdsCache.has(trackId);
+    incrementStream404Reason(wasSeenBefore ? "evicted" : "unknown_track");
+    return res.status(404).json({
+      sucesso: false,
+      mensagem: "❌ track_id não encontrado.",
+      motivo: wasSeenBefore ? "evicted" : "unknown_track",
     });
   }
 
@@ -1643,10 +1882,17 @@ app.get("/stream/:trackId", async (req, res) => {
     );
   }
 
+  if (req.headers.range) {
+    metrics.increment("stream_range_resume_count", 1);
+  }
+
   const streamStartedAt = Date.now();
+  const streamLease = acquireActiveTrackLease(cachedTrack);
 
   try {
-    const refreshedTrack = await refreshTrackIfNeeded(cachedTrack);
+    let refreshedTrack = await refreshTrackIfNeeded(streamLease.track);
+    refreshedTrack = updateActiveTrackLease(refreshedTrack);
+
     const shouldTranscodeToOpus =
       !req.headers.range &&
       (ENABLE_OPUS_TRANSCODE ||
@@ -1664,25 +1910,53 @@ app.get("/stream/:trackId", async (req, res) => {
       return;
     }
 
-    const warmChunk = shouldUseWarmChunk(refreshedTrack, req)
-      ? refreshedTrack.warmedChunk
-      : null;
+    let streamTrack = refreshedTrack;
 
-    await proxyRemoteStream({
-      req,
-      res,
-      streamUrl: refreshedTrack.stream_source_url,
-      timeoutMs: UPSTREAM_REQUEST_TIMEOUT_MS,
-      warmChunk,
-      onFirstByte: () => {
-        metrics.observe("stream_start_ms", Date.now() - streamStartedAt);
-      },
-    });
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const warmChunk =
+        attempt === 0 && shouldUseWarmChunk(streamTrack, req)
+          ? streamTrack.warmedChunk
+          : null;
+
+      try {
+        await proxyRemoteStream({
+          req,
+          res,
+          streamUrl: streamTrack.stream_source_url,
+          timeoutMs: UPSTREAM_REQUEST_TIMEOUT_MS,
+          warmChunk,
+          onFirstByte: () => {
+            metrics.observe("stream_start_ms", Date.now() - streamStartedAt);
+          },
+        });
+        if (attempt > 0) {
+          metrics.increment("stream_refresh_retry_success", 1);
+        }
+        return;
+      } catch (error) {
+        if (Number(error?.upstreamStatusCode) === 403) {
+          metrics.increment("stream_upstream_403", 1);
+        }
+
+        const canRetry =
+          attempt === 0 &&
+          !res.headersSent &&
+          shouldRetryExpiredStream(error);
+        if (!canRetry) {
+          throw error;
+        }
+
+        metrics.increment("stream_refresh_retry", 1);
+        streamTrack = await refreshTrackIfNeeded(streamTrack, { force: true });
+        streamTrack = updateActiveTrackLease(streamTrack);
+      }
+    }
   } catch (error) {
     console.error(`❌ Stream falhou | track_id=${trackId} | erro=${error.message}`);
 
     if (!res.headersSent) {
-      return res.status(502).json({
+      const isTimeout = /timeout/i.test(String(error?.message || ""));
+      return res.status(isTimeout ? 503 : 502).json({
         sucesso: false,
         mensagem: "❌ Falha ao iniciar stream.",
         erro: error.message,
@@ -1693,6 +1967,7 @@ app.get("/stream/:trackId", async (req, res) => {
       res.end();
     }
   } finally {
+    streamLease.release();
     streamIpLimiter.release(ip);
     streamGuildLimiter.release(guildId);
   }
@@ -1705,6 +1980,19 @@ app.get("/stream/:requestId/:arquivo", (req, res) => {
   const requestId = decodeURIComponent(req.params.requestId);
   const arquivo = decodeURIComponent(req.params.arquivo);
   const caminho = path.join(DOWNLOADS_DIR, requestId, arquivo);
+
+  if (!fs.existsSync(caminho)) {
+    incrementStream404Reason("local_missing");
+    return res.status(404).json({
+      sucesso: false,
+      mensagem: "❌ Arquivo não encontrado.",
+    });
+  }
+
+  if (req.headers.range) {
+    metrics.increment("stream_range_resume_count", 1);
+  }
+
   return streamLocalFileWithRange(req, res, caminho, "video/mp4");
 });
 

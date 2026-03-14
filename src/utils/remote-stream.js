@@ -1,8 +1,26 @@
 const http = require("http");
 const https = require("https");
 
+const SHARED_HTTP_AGENT = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: 256,
+  maxFreeSockets: 32,
+});
+
+const SHARED_HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 10000,
+  maxSockets: 256,
+  maxFreeSockets: 32,
+});
+
 function getHttpClient(urlObject) {
   return urlObject.protocol === "https:" ? https : http;
+}
+
+function getKeepAliveAgent(urlObject) {
+  return urlObject.protocol === "https:" ? SHARED_HTTPS_AGENT : SHARED_HTTP_AGENT;
 }
 
 function parseExpireFromStreamUrl(streamUrl) {
@@ -27,12 +45,14 @@ function parseExpireFromStreamUrl(streamUrl) {
 function createRequest(urlString, options = {}) {
   const urlObject = new URL(urlString);
   const client = getHttpClient(urlObject);
+  const defaultAgent = getKeepAliveAgent(urlObject);
 
   const {
     method = "GET",
     headers = {},
     timeoutMs = 20000,
     rejectUnauthorized = true,
+    agent = defaultAgent,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -42,6 +62,7 @@ function createRequest(urlString, options = {}) {
         method,
         headers,
         rejectUnauthorized,
+        agent,
       },
       (res) => {
         resolve({ req, res, urlObject });
@@ -113,6 +134,23 @@ function copyUpstreamHeaders(
       res.setHeader(header, value);
     }
   }
+}
+
+function parseTotalBytesFromContentRange(contentRangeRaw) {
+  const contentRange = String(contentRangeRaw || "").trim();
+  if (!contentRange) return null;
+
+  const match = contentRange.match(/^bytes\s+\d+-\d+\/(\d+|\*)$/i);
+  if (!match || !match[1] || match[1] === "*") {
+    return null;
+  }
+
+  const total = Number(match[1]);
+  if (!Number.isFinite(total) || total <= 0) {
+    return null;
+  }
+
+  return total;
 }
 
 async function fetchWarmupChunk(streamUrl, options = {}) {
@@ -258,10 +296,18 @@ function proxyRemoteStream({
     const statusCode = upstreamRes.statusCode || 502;
     if (statusCode >= 400) {
       upstreamRes.resume();
-      return done(new Error(`Upstream retornou status ${statusCode}`));
+      const upstreamError = new Error(`Upstream retornou status ${statusCode}`);
+      upstreamError.code = "UPSTREAM_HTTP_ERROR";
+      upstreamError.upstreamStatusCode = statusCode;
+      return done(upstreamError);
     }
 
-    if (useWarmChunk) {
+    const upstreamTotalBytes = parseTotalBytesFromContentRange(
+      upstreamRes.headers["content-range"],
+    );
+    const shouldInjectWarmChunk = useWarmChunk && statusCode === 206;
+
+    if (shouldInjectWarmChunk) {
       res.statusCode = 200;
       res.setHeader("accept-ranges", "bytes");
       res.setHeader(
@@ -272,6 +318,9 @@ function proxyRemoteStream({
         keepContentLength: false,
         keepContentRange: false,
       });
+      if (Number.isFinite(upstreamTotalBytes)) {
+        res.setHeader("content-length", String(upstreamTotalBytes));
+      }
       res.write(warmChunk.buffer);
       markFirstByte();
     } else {
@@ -279,6 +328,9 @@ function proxyRemoteStream({
       copyUpstreamHeaders(upstreamRes.headers, res, {
         keepContentLength: true,
       });
+      if (!res.hasHeader("accept-ranges")) {
+        res.setHeader("accept-ranges", "bytes");
+      }
     }
 
     upstreamRes.on("data", () => {

@@ -11,6 +11,7 @@
     "start": "node src/server.js",
     "dev": "node src/server.js",
     "install:yt-dlp": "node scripts/install.js",
+    "test:stream-regression": "node scripts/test-stream-range-regression.js",
     "test:request": "node scripts/test-request.js",
     "start:pm2": "pm2 start src/server.js --name yt-dls",
     "stop:pm2": "pm2 stop yt-dls",
